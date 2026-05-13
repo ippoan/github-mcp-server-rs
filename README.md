@@ -176,6 +176,61 @@ src/
 └── mcp_server.rs   — rmcp ServerHandler 実装 + tool_router (whoami / list_repos)
 ```
 
+## Claude Code on the web から使う (別 repo から install hook 経由)
+
+このリポジトリは、**他のリポジトリ** が Claude Code on the web セッション開始時に
+`github-mcp-server-rs` を自動セットアップできる **再利用可能な SessionStart hook**
+(`.claude/hooks/install-mcp.sh`) を公開している。
+
+### 仕組み
+
+```
+consumer-repo/.claude/hooks/session-start.sh
+  └─ curl https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/.claude/hooks/install-mcp.sh | bash
+       ├─ GitHub Releases から binary を download (latest or GITHUB_MCP_PIN_TAG)
+       ├─ cloudflared を download
+       ├─ auth (device flow) を実行 — browser で approve
+       ├─ serve を 127.0.0.1:18765 で background 起動
+       ├─ cloudflared tunnel で公開 URL を取得
+       └─ serve を tunnel host を allowed-hosts に追加して再起動
+            ⇒ MCP URL (https://xxx.trycloudflare.com/mcp) を
+              $GITHUB_MCP_URL & .claude/mcp-state/mcp-url に書き出す
+```
+
+### 使い方 (consumer repo 側)
+
+`examples/consumer-claude-hook/` にコピー用のテンプレを置いている。最短手順:
+
+```bash
+# consumer repo で実行
+mkdir -p .claude/hooks
+curl -sSfL https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/examples/consumer-claude-hook/.claude/hooks/session-start.sh \
+  -o .claude/hooks/session-start.sh
+chmod +x .claude/hooks/session-start.sh
+curl -sSfL https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/examples/consumer-claude-hook/.claude/settings.json \
+  -o .claude/settings.json
+```
+
+Claude Code on the web 側で secret を 1 つ登録:
+
+- `GITHUB_MCP_INTERNAL_SHARED_SECRET` — auth-worker の `INTERNAL_SHARED_SECRET`
+
+セッション開始 → hook 内で device flow の URL が stderr に出るので、
+browser で開いて approve → 自動的に MCP server が立ち上がり、tunnel URL が
+hook の最後にプリントされる。その URL を Claude Code (web) → MCP servers
+に **Streamable HTTP** transport で登録すれば `whoami` / `list_repos` 等が使える。
+
+### Optional 環境変数 (consumer hook の curl 前に export)
+
+| Env | Default | 用途 |
+|---|---|---|
+| `GITHUB_MCP_ENV` | `staging` | `staging` or `prod` |
+| `GITHUB_MCP_BIND_PORT` | `18765` | local serve port |
+| `GITHUB_MCP_PIN_TAG` | latest release | 再現性のため tag pin (例: `v0.0.4`) |
+
+> **Note**: hook は `CLAUDE_CODE_REMOTE=true` のときだけ動く。local Claude Code
+> セッションでは no-op。
+
 ## 関連
 
 - auth-worker: <https://github.com/ippoan/auth-worker>
