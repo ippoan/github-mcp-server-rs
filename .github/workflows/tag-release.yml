@@ -1,0 +1,32 @@
+name: Tag Release
+
+# workflow_dispatch (手動 or ci-dashboard 経由) で patch tag を作成 + push する
+# caller workflow。ippoan/ci-workflows の reusable に委譲。
+#
+# 起動方法:
+#   1. ci-dashboard UI → 該当 repo の "Tag Release" ボタン
+#      → POST /tag-release { repo: "ippoan/github-mcp-server-rs" }
+#      → ci-dashboard が workflow_dispatch を投げる
+#   2. CLI: gh workflow run tag-release.yml -R ippoan/github-mcp-server-rs
+#      (※ Claude からは hook で block されるので user 手動)
+#
+# tag が push されると別 workflow `release.yml` が発火し、
+# rust-binary-release reusable で GitHub Release + バイナリ attach。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (patch / minor / major)"
+        type: string
+        default: "patch"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ippoan/ci-workflows/.github/workflows/tag-release.yml@main
+    with:
+      bump: ${{ inputs.bump }}
+    secrets: inherit
