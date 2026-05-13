@@ -22,6 +22,9 @@ directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+schemars = "1.2.1"
+rmcp = { version = "1.6.0", features = ["server", "transport-streamable-http-server", "macros", "schemars", "server-side-http"] }
+axum = "0.8.9"
 
 [dev-dependencies]
 mockito = "1"

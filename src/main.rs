@@ -13,12 +13,19 @@
 mod auth;
 mod config;
 mod introspect;
+mod mcp_server;
 mod token_cache;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::mcp_server::{GithubContext, GithubMcp};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 
 use crate::config::{AuthEnv, Config};
 use crate::token_cache::TokenSet;
@@ -69,6 +76,22 @@ enum Command {
     Logout,
     /// Show effective config (URLs, cache path) without secrets
     Doctor,
+    /// Run MCP server (Streamable HTTP transport) on the given bind address.
+    /// Requires a cached token (run `auth` first). Loads github_token via
+    /// introspect at startup and caches in-memory for the process lifetime.
+    Serve {
+        /// Bind address (host:port)
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: String,
+        /// Allowed Host header values (comma-separated). Default: loopback only.
+        /// Set explicitly for public exposure (cloudflared tunnel etc.).
+        #[arg(long, value_delimiter = ',')]
+        allowed_hosts: Option<Vec<String>>,
+        /// Use stateless JSON response mode (no SSE framing). Recommended for
+        /// simple request/response tools.
+        #[arg(long, default_value_t = true)]
+        json_response: bool,
+    },
 }
 
 fn build_config(cli: &Cli) -> Result<Config> {
@@ -172,6 +195,86 @@ async fn run_whoami(client: &Client, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+async fn run_serve(
+    client: &Client,
+    cfg: &Config,
+    bind: &str,
+    allowed_hosts: Option<Vec<String>>,
+    json_response: bool,
+) -> Result<()> {
+    if cfg.internal_shared_secret.is_empty() {
+        return Err(anyhow!(
+            "--internal-shared-secret (or env GITHUB_MCP_INTERNAL_SHARED_SECRET) is required for serve"
+        ));
+    }
+
+    let path = cfg.token_cache_path()?;
+    let mut token = TokenSet::load(&path)?.ok_or_else(|| {
+        anyhow!(
+            "no cached token for env={} — run `auth` first",
+            cfg.env.as_str()
+        )
+    })?;
+    if token.is_expired(60) {
+        println!("→ Access token expired, refreshing ...");
+        token = auth::refresh(client, cfg, &token.refresh_token).await?;
+        token.save(&path)?;
+    }
+
+    println!("→ Calling /mcp/introspect to recover github_token ...");
+    let active = introspect::introspect(client, cfg, &token.access_token)
+        .await?
+        .ok_or_else(|| anyhow!("introspect returned active:false — token may have been revoked"))?;
+    println!(
+        "✓ Introspect OK: github_login={} scope={}",
+        active.github_login, active.scope
+    );
+
+    let ctx = Arc::new(GithubContext {
+        github_token: active.github_token,
+        github_login: active.github_login,
+        scope: active.scope,
+        client: client.clone(),
+    });
+
+    // rmcp StreamableHttpService の factory は session ごとに呼ばれる
+    let factory_ctx = ctx.clone();
+    let service: StreamableHttpService<GithubMcp, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(GithubMcp::new(factory_ctx.clone())),
+        Default::default(),
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(json_response)
+            .with_allowed_hosts(allowed_hosts.unwrap_or_else(|| {
+                vec![
+                    "localhost".into(),
+                    "127.0.0.1".into(),
+                    "::1".into(),
+                    // bind した host:port もデフォで許可しておく
+                    bind.to_string(),
+                ]
+            })),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    let addr = listener.local_addr()?;
+    println!(
+        "⇒ MCP server listening on http://{addr}/mcp (env={})",
+        cfg.env.as_str()
+    );
+    println!("   Register URL in Claude Code Web → MCP connector.");
+    println!(
+        "   ※ Ctrl-C で停止。token 期限は {} (Unix epoch)。",
+        token.expires_at
+    );
+
+    axum::serve(listener, router).await.context("axum serve")?;
+    Ok(())
+}
+
 fn run_logout(cfg: &Config) -> Result<()> {
     let path = cfg.token_cache_path()?;
     TokenSet::delete(&path)?;
@@ -230,5 +333,10 @@ async fn main() -> Result<()> {
         Command::Whoami => run_whoami(&client, &cfg).await,
         Command::Logout => run_logout(&cfg),
         Command::Doctor => run_doctor(&cfg),
+        Command::Serve {
+            bind,
+            allowed_hosts,
+            json_response,
+        } => run_serve(&client, &cfg, &bind, allowed_hosts, json_response).await,
     }
 }

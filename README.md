@@ -93,6 +93,54 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 | `whoami` | cache 読み → 期限切れなら refresh → introspect で github_token 取得 → GitHub `/user` 確認 |
 | `logout` | token cache を削除 |
 | `doctor` | 設定 / cache 状況をダンプ (secret 値は出さない) |
+| `serve` | MCP server (Streamable HTTP) を起動。Claude Code Web / Claude Code CLI 等の MCP client から `POST /mcp` に接続 |
+
+## MCP server mode
+
+`auth` でログイン済みの状態で `serve` を起動すると、`POST http://<bind>/mcp` で MCP protocol (Streamable HTTP, 2025-06-18 spec) を喋る endpoint が立ち上がる。起動時に `/mcp/introspect` を 1 回叩いて github_token を回収し、in-memory に保持。
+
+```bash
+export GITHUB_MCP_INTERNAL_SHARED_SECRET="<staging INTERNAL_SHARED_SECRET>"
+./github-mcp-server-rs serve --env staging --bind 127.0.0.1:18765
+# ⇒ MCP server listening on http://127.0.0.1:18765/mcp (env=staging)
+```
+
+### Tools (MVP)
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `whoami` | (なし) | `{ github_login, scope }` |
+| `list_repos` | `visibility?` ("all" / "public" / "private")、`per_page?` (1–100)、`page?` (1+) | `{ page, per_page, count, repos: [{ full_name, private, description, html_url, default_branch, language, stargazers_count, pushed_at }] }` |
+
+### Claude Code Web で使う (HTTPS tunnel 経由)
+
+Claude Code Web (claude.ai/code) の MCP connector は **HTTPS な URL** が必要。ローカル `127.0.0.1` は届かないので、`cloudflared` の Quick Tunnel で 1 コマンド公開:
+
+```bash
+# (別ターミナル) cloudflared がインストール済みなら:
+cloudflared tunnel --url http://127.0.0.1:18765
+# → "https://xxx-yyy-zzz.trycloudflare.com" が表示される
+```
+
+その後 Claude Code Web の設定で MCP server を追加:
+
+- URL: `https://xxx-yyy-zzz.trycloudflare.com/mcp`
+- Transport: Streamable HTTP (default)
+
+接続後、Claude に `whoami` ツールを呼ばせて自分の github_login が返れば成功。
+
+### Allowed hosts
+
+Cloudflare 経由で公開する場合、`Host` header validation を緩めたい時は明示:
+
+```bash
+./github-mcp-server-rs serve --env staging \
+  --bind 0.0.0.0:18765 \
+  --allowed-hosts "localhost,127.0.0.1,xxx-yyy-zzz.trycloudflare.com"
+```
+
+(`--allowed-hosts` を省略すると default = `localhost,127.0.0.1,::1` + `--bind` 値。
+cloudflared 経由だと `Host` は cloudflare ドメイン名で来るので追加が必要。)
 
 ## Global flags
 
@@ -120,11 +168,12 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 
 ```
 src/
-├── main.rs         — CLI entry (clap)
+├── main.rs         — CLI entry (clap)、Auth/Whoami/Logout/Doctor/Serve subcommand
 ├── config.rs       — env switch (AuthEnv::{Staging,Prod})、URL 組み立て、cache path
 ├── auth.rs         — RFC 8628 device flow (start + poll + refresh)
 ├── introspect.rs   — POST /mcp/introspect → github_token 復元
-└── token_cache.rs  — ~/.config/.../token-{env}.json への永続化 (0600 perm)
+├── token_cache.rs  — ~/.config/.../token-{env}.json への永続化 (0600 perm)
+└── mcp_server.rs   — rmcp ServerHandler 実装 + tool_router (whoami / list_repos)
 ```
 
 ## 関連
