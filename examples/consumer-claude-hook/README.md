@@ -13,14 +13,7 @@ your-repo/
 └── ...
 ```
 
-## 1. Set the secret
-
-In Claude Code (web) → Settings → Secrets, add:
-
-- `GITHUB_MCP_INTERNAL_SHARED_SECRET` — auth-worker `INTERNAL_SHARED_SECRET`
-  for the env you want (`staging` by default).
-
-## 2. Copy the two files into your repo
+## 1. Copy the two files into your repo
 
 ```bash
 mkdir -p .claude/hooks
@@ -34,7 +27,11 @@ git commit -m "claude code: bring up github-mcp-server-rs on session start"
 git push
 ```
 
-## 3. Start a Claude Code on the web session
+> **No secret registration needed.** From `v0.0.5` onwards the auth-worker
+> `INTERNAL_SHARED_SECRET` is **build-time embedded** into the release binary
+> (#25). The hook just downloads it and goes.
+
+## 2. Start a Claude Code on the web session
 
 When the session starts, the hook will:
 
@@ -57,4 +54,5 @@ Set these in the consumer hook before the curl pipe:
 |---|---|---|
 | `GITHUB_MCP_ENV` | `staging` | `staging` or `prod` |
 | `GITHUB_MCP_BIND_PORT` | `18765` | local serve port |
-| `GITHUB_MCP_PIN_TAG` | latest release | pin to a specific tag, e.g. `v0.0.4` |
+| `GITHUB_MCP_PIN_TAG` | latest release | pin to a specific tag, e.g. `v0.0.5`. **Pre-`v0.0.5` tags lack the embed and will 401 against auth-worker** (#25) |
+| `GITHUB_MCP_INTERNAL_SHARED_SECRET` | (embed) | advanced: override the embedded secret (e.g. testing against your own auth-worker fork) |

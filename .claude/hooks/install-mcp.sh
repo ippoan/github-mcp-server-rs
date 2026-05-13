@@ -17,13 +17,17 @@
 #     https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/.claude/hooks/install-mcp.sh \
 #     | bash
 #
-# Required Claude Code secret (Web settings → Secrets):
-#   GITHUB_MCP_INTERNAL_SHARED_SECRET    — auth-worker INTERNAL_SHARED_SECRET
+# auth-worker INTERNAL_SHARED_SECRET は v0.0.5 から release binary に build-time
+# embed されている (#25)。consumer 側 secret 登録は不要。
 #
 # Optional env (with defaults):
 #   GITHUB_MCP_ENV          staging|prod                          (default: staging)
 #   GITHUB_MCP_BIND_PORT    local serve port                       (default: 18765)
-#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.4)          (default: latest)
+#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.5)          (default: latest)
+#
+# Override (advanced; 通常は不要):
+#   GITHUB_MCP_INTERNAL_SHARED_SECRET — embed されている値を上書きしたい時のみ
+#                                       (例: 自分の auth-worker fork を叩く dev)
 #
 # On success:
 #   - binary installed at  $HOME/.local/bin/github-mcp-server-rs
@@ -110,14 +114,11 @@ if ! command -v cloudflared >/dev/null 2>&1; then
   chmod +x "$INSTALL_DIR/cloudflared"
 fi
 
-# ─── 3. verify INTERNAL_SHARED_SECRET ─────────────────────────────────────────
-if [ -z "${GITHUB_MCP_INTERNAL_SHARED_SECRET:-}" ]; then
-  echo "[install-mcp] ERROR: GITHUB_MCP_INTERNAL_SHARED_SECRET is not set." >&2
-  echo "  Add it as a Claude Code on Web secret and retry the session." >&2
-  exit 1
-fi
+# ─── 3. device-flow auth if no token cache yet ────────────────────────────────
+# INTERNAL_SHARED_SECRET は v0.0.5+ release binary に embed 済みなので、ここで
+# 検証する必要は無い (#25)。env で override したい advanced ユーザは serve
+# 起動時に child process が inherit するので追加の処理不要。
 
-# ─── 4. device-flow auth if no token cache yet ────────────────────────────────
 TOKEN_FILE="$HOME/.config/github-mcp-server-rs/token-${ENV_NAME}.json"
 if [ ! -f "$TOKEN_FILE" ]; then
   echo "" >&2
@@ -129,7 +130,7 @@ if [ ! -f "$TOKEN_FILE" ]; then
   "$BIN" auth --env "$ENV_NAME" >&2
 fi
 
-# ─── 5. (re)start serve in the background ─────────────────────────────────────
+# ─── 4. (re)start serve in the background ─────────────────────────────────────
 start_serve() {
   local allowed_hosts="$1"
   if [ -f "$STATE_DIR/serve.pid" ]; then
@@ -163,7 +164,7 @@ if [ "$ready" != "1" ]; then
   exit 1
 fi
 
-# ─── 6. start cloudflared & extract the trycloudflare URL ────────────────────
+# ─── 5. start cloudflared & extract the trycloudflare URL ────────────────────
 : > "$STATE_DIR/cloudflared.log"
 nohup cloudflared tunnel --no-autoupdate \
   --url "http://127.0.0.1:$BIND_PORT" \
@@ -184,11 +185,11 @@ if [ -z "$TUNNEL_URL" ]; then
   exit 1
 fi
 
-# ─── 7. restart serve with the trycloudflare host in --allowed-hosts ──────────
+# ─── 6. restart serve with the trycloudflare host in --allowed-hosts ──────────
 TUNNEL_HOST="${TUNNEL_URL#https://}"
 start_serve "localhost,127.0.0.1,$TUNNEL_HOST"
 
-# ─── 8. publish the URL for the session ───────────────────────────────────────
+# ─── 7. publish the URL for the session ───────────────────────────────────────
 MCP_URL="$TUNNEL_URL/mcp"
 echo "$MCP_URL" > "$STATE_DIR/mcp-url"
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then

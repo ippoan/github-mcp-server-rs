@@ -206,7 +206,7 @@ MCP_INTERNAL_SECRET="<staging value>" cargo build --release
 | `auth`: `device_authorization failed: HTTP 503` | auth-worker の `MCP_OAUTH_KV` 等の env / KV binding が未投入。staging なら確認、prod なら #97 手順 |
 | ブラウザで approve 後も polling が `authorization_pending` で止まる | GitHub OAuth App の callback URL が staging/prod と一致していない |
 | approve 後に「Access denied」HTML | `GITHUB_MCP_USER_ALLOWLIST` に自分の login が無い (fail-closed) |
-| `whoami`: `401 — check INTERNAL_SHARED_SECRET` | (a) release binary が **`v0.0.5+`** か `--version` で確認 (それ以前は embed 無し)、(b) staging/prod を取り違えていないか、(c) `cargo run` してるなら [Local development](#local-development) のとおり env override が要る (dev fallback だと 401 になる) |
+| `whoami`: `401 — check INTERNAL_SHARED_SECRET` | (a) `doctor` の `internal_secret: (set, N chars)` を見て **N が 21 なら dev fallback** = embed が無い古い binary か `cargo run` で env 未指定。`v0.0.5+` の release binary を取り直す、または `MCP_INTERNAL_SECRET` 付きで `cargo build` (`Local development` 参照)、(b) staging/prod を取り違えていないか |
 | `whoami`: `active:false` | token が revoke / `github_token:{sub}` が KV から TTL 切れ (30d) — `auth` をやり直す |
 
 ## アーキテクチャ
@@ -233,6 +233,7 @@ src/
 consumer-repo/.claude/hooks/session-start.sh
   └─ curl https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/.claude/hooks/install-mcp.sh | bash
        ├─ GitHub Releases から binary を download (latest or GITHUB_MCP_PIN_TAG)
+       │   ※ v0.0.5+ binary は INTERNAL_SHARED_SECRET を build-time embed 済 (#25)
        ├─ cloudflared を download
        ├─ auth (device flow) を実行 — browser で approve
        ├─ serve を 127.0.0.1:18765 で background 起動
@@ -256,9 +257,8 @@ curl -sSfL https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/ex
   -o .claude/settings.json
 ```
 
-Claude Code on the web 側で secret を 1 つ登録:
-
-- `GITHUB_MCP_INTERNAL_SHARED_SECRET` — auth-worker の `INTERNAL_SHARED_SECRET`
+**Claude Code Web 側で secret 登録は不要** (`v0.0.5+` から
+`INTERNAL_SHARED_SECRET` は release binary に build-time embed 済 — [#25](https://github.com/ippoan/github-mcp-server-rs/issues/25))。
 
 セッション開始 → hook 内で device flow の URL が stderr に出るので、
 browser で開いて approve → 自動的に MCP server が立ち上がり、tunnel URL が
@@ -271,7 +271,8 @@ hook の最後にプリントされる。その URL を Claude Code (web) → MC
 |---|---|---|
 | `GITHUB_MCP_ENV` | `staging` | `staging` or `prod` |
 | `GITHUB_MCP_BIND_PORT` | `18765` | local serve port |
-| `GITHUB_MCP_PIN_TAG` | latest release | 再現性のため tag pin (例: `v0.0.4`) |
+| `GITHUB_MCP_PIN_TAG` | latest release | 再現性のため tag pin。**`v0.0.5` 以上**を指定すること (それ以前は embed が無いので 401 になる) |
+| `GITHUB_MCP_INTERNAL_SHARED_SECRET` | (embed) | advanced: embed されている secret を上書きしたい時のみ (例: 自分の auth-worker fork に当てる dev 用途) |
 
 > **Note**: hook は `CLAUDE_CODE_REMOTE=true` のときだけ動く。local Claude Code
 > セッションでは no-op。
