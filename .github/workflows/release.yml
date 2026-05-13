@@ -1,0 +1,27 @@
+name: Release
+
+# tag push (v*) 起点で ippoan/ci-workflows の rust-binary-release reusable を呼び、
+# GitHub Release を作成 + バイナリを attach する。
+#
+# 初回 tag: `gh workflow run tag-release.yml -R ippoan/github-mcp-server-rs` か
+#          `git tag v0.1.0 && git push origin v0.1.0` で起動。
+# tag に `-` 含まれていたら自動 prerelease (例: v0.2.0-rc1)。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ippoan/ci-workflows/.github/workflows/rust-binary-release.yml@main
+    with:
+      bin_name: github-mcp-server-rs
+      # 最初は linux x86_64 のみ。macOS / Windows / aarch64 が要るようになったら
+      # ここに JSON で足す:
+      #   targets: '["x86_64-unknown-linux-gnu","x86_64-apple-darwin","aarch64-apple-darwin"]'
+      targets: '["x86_64-unknown-linux-gnu"]'
+    permissions:
+      contents: write
