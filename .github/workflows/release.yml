@@ -30,3 +30,8 @@ jobs:
       #     ]
     permissions:
       contents: write
+    secrets:
+      # build.rs が読んで release binary に embed する quasi-public な auth-worker
+      # introspect secret (#25)。repo secret として登録されていない場合は空文字列
+      # として渡り、binary 側は dev fallback ("dev-secret-do-not-use") に落ちる。
+      MCP_INTERNAL_SECRET: ${{ secrets.MCP_INTERNAL_SECRET }}

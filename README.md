@@ -35,8 +35,11 @@ Claude Code / Claude Desktop などの MCP host から GitHub API を叩く用�
 
 - Rust 1.75+ (`rustup install stable`)
 - `ippoan/auth-worker` が staging deploy 済み (`auth-staging.ippoan.org`)
-- staging の `INTERNAL_SHARED_SECRET` を持っている (auth-worker の `.dev.vars` or wrangler secret)
 - GitHub login が `GITHUB_MCP_USER_ALLOWLIST` に登録されている (staging default = `["yhonda-ohishi"]`)
+
+> `INTERNAL_SHARED_SECRET` は release binary に build-time embed されているので、
+> Releases から download した binary を使う場合は何も設定不要。手元で
+> `cargo build` する場合の解決順は [Secret resolution order](#secret-resolution-order) 参照。
 
 ### Build
 
@@ -49,8 +52,6 @@ ln -sf "$(pwd)/target/release/github-mcp-server-rs" ~/.local/bin/  # optional
 ### Staging — 認証 (一度だけ)
 
 ```bash
-export GITHUB_MCP_INTERNAL_SHARED_SECRET="<staging INTERNAL_SHARED_SECRET>"
-
 ./target/release/github-mcp-server-rs auth --env staging
 # → ブラウザで verification_uri_complete を開く
 # → GitHub OAuth → "認証完了" 画面
@@ -77,7 +78,6 @@ export GITHUB_MCP_INTERNAL_SHARED_SECRET="<staging INTERNAL_SHARED_SECRET>"
 prod 環境が準備済 ([auth-worker issue #97](https://github.com/ippoan/auth-worker/issues/97)) になったら:
 
 ```bash
-export GITHUB_MCP_INTERNAL_SHARED_SECRET="<prod INTERNAL_SHARED_SECRET>"
 ./target/release/github-mcp-server-rs auth --env prod
 ./target/release/github-mcp-server-rs whoami --env prod
 ```
@@ -100,7 +100,6 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 `auth` でログイン済みの状態で `serve` を起動すると、`POST http://<bind>/mcp` で MCP protocol (Streamable HTTP, 2025-06-18 spec) を喋る endpoint が立ち上がる。起動時に `/mcp/introspect` を 1 回叩いて github_token を回収し、in-memory に保持。
 
 ```bash
-export GITHUB_MCP_INTERNAL_SHARED_SECRET="<staging INTERNAL_SHARED_SECRET>"
 ./github-mcp-server-rs serve --env staging --bind 127.0.0.1:18765
 # ⇒ MCP server listening on http://127.0.0.1:18765/mcp (env=staging)
 ```
@@ -148,11 +147,57 @@ cloudflared 経由だと `Host` は cloudflare ドメイン名で来るので追
 |---|---|---|
 | `--env staging\|prod` | URL preset の切替 | `staging` |
 | `--auth-base <URL>` | base URL 任意上書き (wt-quick の `*.trycloudflare.com` 用) | — |
-| `--internal-shared-secret <S>` / `GITHUB_MCP_INTERNAL_SHARED_SECRET` | introspect 認証用 secret | — |
+| `--internal-shared-secret <S>` / `GITHUB_MCP_INTERNAL_SHARED_SECRET` | introspect 認証用 secret の **override** (通常は build-time embed で足りる、[Secret resolution order](#secret-resolution-order) 参照) | build-time embed |
 | `--client-id <ID>` / `GITHUB_MCP_CLIENT_ID` | device_authorization の client_id | `github-mcp-server-rs` |
 | `--scope <S>` | MCP scope | `mcp.read mcp.write` |
 
 `RUST_LOG=debug` で reqwest の詳細ログが出る。
+
+## Secret resolution order
+
+`internal_shared_secret` (`/mcp/introspect` の `Authorization` header に乗る値) は
+以下の順で解決される:
+
+1. `--internal-shared-secret <S>` (CLI flag) — 明示 override
+2. env `GITHUB_MCP_INTERNAL_SHARED_SECRET` — env override (staging で別値を使いたい等)
+3. **build-time embed** `MCP_INTERNAL_SECRET` — release binary に焼き込み済み (`build.rs` 経由、 `option_env!()` で読み込み)
+4. dev fallback `"dev-secret-do-not-use"` — どれも空のときの最終手段 (本物 auth-worker は 401 を返す)
+
+### なぜ build embed なのか (quasi-public secret)
+
+この secret は **intentionally quasi-public**。release binary を public にすると
+`strings` で読めるが、それで何もできないように設計してある。本当の認可境界は
+auth-worker `/mcp/introspect` 内の **JWT 署名検証** であり、shared secret 単体では
+github_token は引き出せない (RFC 7662 §2.1 の resource-server ↔ authz-server 境界
+のうち、resource-server 側 client auth)。詳細は
+[#25](https://github.com/ippoan/github-mcp-server-rs/issues/25) 参照。
+
+これにより consumer (Claude Code on Web ユーザ) が自前で secret を登録する手間が
+消える (= `curl | bash` で完結する)。
+
+## Local development
+
+`cargo run` / `cargo build` を `MCP_INTERNAL_SECRET` env 無しで実行すると、
+build embed が空文字 → 上記順 4 の dev fallback (`"dev-secret-do-not-use"`) が
+使われる。本物の auth-worker (staging / prod) はこれを 401 で拒否するので、
+ローカルで本物に当てたいときは:
+
+```bash
+# A) 本物の staging に当てる: env で override
+GITHUB_MCP_INTERNAL_SHARED_SECRET="<staging value>" \
+  cargo run --release -- whoami --env staging
+
+# B) ローカル auth-worker (wt-quick / Incus 等) に当てる
+#    auth-worker 側の INTERNAL_SHARED_SECRET も "dev-secret-do-not-use" に
+#    揃えると zero-config で通る
+cargo run --release -- whoami --env staging \
+  --auth-base https://xxx.trycloudflare.com
+
+# C) release binary 相当の build を手元で再現する
+MCP_INTERNAL_SECRET="<staging value>" cargo build --release
+./target/release/github-mcp-server-rs doctor
+# → internal_secret: (set, N chars)
+```
 
 ## トラブルシューティング
 
@@ -161,7 +206,7 @@ cloudflared 経由だと `Host` は cloudflare ドメイン名で来るので追
 | `auth`: `device_authorization failed: HTTP 503` | auth-worker の `MCP_OAUTH_KV` 等の env / KV binding が未投入。staging なら確認、prod なら #97 手順 |
 | ブラウザで approve 後も polling が `authorization_pending` で止まる | GitHub OAuth App の callback URL が staging/prod と一致していない |
 | approve 後に「Access denied」HTML | `GITHUB_MCP_USER_ALLOWLIST` に自分の login が無い (fail-closed) |
-| `whoami`: `401 — check INTERNAL_SHARED_SECRET` | `--internal-shared-secret` / env が間違い、または staging/prod を取り違え |
+| `whoami`: `401 — check INTERNAL_SHARED_SECRET` | (a) release binary が **`v0.0.5+`** か `--version` で確認 (それ以前は embed 無し)、(b) staging/prod を取り違えていないか、(c) `cargo run` してるなら [Local development](#local-development) のとおり env override が要る (dev fallback だと 401 になる) |
 | `whoami`: `active:false` | token が revoke / `github_token:{sub}` が KV から TTL 切れ (30d) — `auth` をやり直す |
 
 ## アーキテクチャ

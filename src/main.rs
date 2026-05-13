@@ -8,7 +8,11 @@
 //! 共通 flag:
 //!   `--env staging|prod` で auth-worker base URL を切替 (default: staging で先行検証)
 //!   `--auth-base <URL>` で base を任意上書き (local dev / wt-quick URL 用)
-//!   `--internal-shared-secret <S>` or env `GITHUB_MCP_INTERNAL_SHARED_SECRET`
+//!   internal_shared_secret 解決順:
+//!     1. `--internal-shared-secret <S>` (CLI)
+//!     2. env `GITHUB_MCP_INTERNAL_SHARED_SECRET`
+//!     3. build-time embed `MCP_INTERNAL_SECRET` (release binary に焼き込み — build.rs)
+//!     4. dev fallback `"dev-secret-do-not-use"` (本物 auth-worker は 401 を返す)
 
 mod auth;
 mod config;
@@ -44,7 +48,9 @@ struct Cli {
     #[arg(long, global = true)]
     auth_base: Option<String>,
 
-    /// auth-worker INTERNAL_SHARED_SECRET (required for `whoami` / any introspect call)
+    /// auth-worker INTERNAL_SHARED_SECRET。通常は release binary に build-time embed
+    /// されているので未指定で OK。上書きしたい時のみ CLI or env で指定。
+    /// 解決順: CLI → env → build-time embed → dev fallback (file-level doc 参照)。
     #[arg(long, env = "GITHUB_MCP_INTERNAL_SHARED_SECRET", global = true)]
     internal_shared_secret: Option<String>,
 
@@ -99,7 +105,7 @@ fn build_config(cli: &Cli) -> Result<Config> {
         .auth_base
         .clone()
         .unwrap_or_else(|| cli.env.default_base().to_string());
-    let internal_shared_secret = cli.internal_shared_secret.clone().unwrap_or_default();
+    let internal_shared_secret = resolve_internal_secret(cli.internal_shared_secret.as_deref());
     Ok(Config {
         env: cli.env,
         auth_base,
@@ -107,6 +113,25 @@ fn build_config(cli: &Cli) -> Result<Config> {
         client_id: cli.client_id.clone(),
         scope: cli.scope.clone(),
     })
+}
+
+/// CLI/env → build-time embed → dev fallback の順に解決。空文字列は "未設定" 扱い。
+///
+/// release binary は CI で `MCP_INTERNAL_SECRET` 環境変数下に build され、
+/// `build.rs` 経由で `option_env!()` の対象として焼き付けられる (#25)。
+/// 当該 secret は intentionally quasi-public (#20)。本物の認可境界は
+/// auth-worker `/mcp/introspect` 内の JWT 署名検証側にある。
+fn resolve_internal_secret(cli: Option<&str>) -> String {
+    if let Some(s) = cli {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    let embedded = option_env!("MCP_INTERNAL_SECRET").unwrap_or("");
+    if !embedded.is_empty() {
+        return embedded.to_string();
+    }
+    "dev-secret-do-not-use".to_string()
 }
 
 async fn run_auth(client: &Client, cfg: &Config) -> Result<()> {
@@ -139,12 +164,6 @@ async fn run_auth(client: &Client, cfg: &Config) -> Result<()> {
 }
 
 async fn run_whoami(client: &Client, cfg: &Config) -> Result<()> {
-    if cfg.internal_shared_secret.is_empty() {
-        return Err(anyhow!(
-            "--internal-shared-secret (or env GITHUB_MCP_INTERNAL_SHARED_SECRET) is required for whoami"
-        ));
-    }
-
     let path = cfg.token_cache_path()?;
     let mut token = TokenSet::load(&path)?.ok_or_else(|| {
         anyhow!(
@@ -202,12 +221,6 @@ async fn run_serve(
     allowed_hosts: Option<Vec<String>>,
     json_response: bool,
 ) -> Result<()> {
-    if cfg.internal_shared_secret.is_empty() {
-        return Err(anyhow!(
-            "--internal-shared-secret (or env GITHUB_MCP_INTERNAL_SHARED_SECRET) is required for serve"
-        ));
-    }
-
     let path = cfg.token_cache_path()?;
     let mut token = TokenSet::load(&path)?.ok_or_else(|| {
         anyhow!(
