@@ -1,7 +1,11 @@
 // `#[path]` include で src/ を test crate に mount する都合、test crate からは
 // 大半の関数 / struct が未使用扱いになる (relay 以外は test code path に出てこないため)。
 // 本来 src/ コードは bin から使われていて生き物なので、test crate scope では抑制。
-#![allow(dead_code, unused_imports)]
+//
+// `clippy::result_large_err` は tokio-tungstenite の `accept_hdr_async` callback の
+// 戻り値型 `Result<Response, ErrorResponse>` (Err variant が大きい) で発火。external API
+// 都合で box 化できないので test ではこれも抑制。
+#![allow(dead_code, unused_imports, clippy::result_large_err)]
 
 //! Integration smoke test for the WS relay (issue #27).
 //!
