@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
+  # tag push (v*) は release.yml が build + release を兼ねるので CI 再走させない
 
 concurrency:
   group: ci-${{ github.ref }}
