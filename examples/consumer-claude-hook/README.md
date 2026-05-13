@@ -35,16 +35,20 @@ git push
 
 When the session starts, the hook will:
 
-1. download the latest `github-mcp-server-rs` release binary,
-2. install `cloudflared`,
-3. run the **device authorization flow** — open the printed
-   `verification_uri_complete` in a browser and approve,
-4. start the MCP server on `127.0.0.1:18765` and a `cloudflared` quick tunnel,
-5. print the public MCP URL (a `https://*.trycloudflare.com/mcp`) and export
+1. download the latest `github-mcp-server-rs` release binary (`v0.0.6+`
+   provides `relay` subcommand — pre-`v0.0.6` tags are rejected),
+2. run the **device authorization flow** if no token cache yet — open the
+   printed `verification_uri_complete` in a browser and approve,
+3. start the MCP server in **outbound WebSocket relay** mode against
+   `wss://mcp(-staging).ippoan.org/u/<your-github-login>/connect` (issue #27,
+   paired with auth-worker #117),
+4. print the **stable** public MCP URL
+   (`https://mcp(-staging).ippoan.org/u/<your-github-login>/mcp`) and export
    it as `$GITHUB_MCP_URL`.
 
 Add that URL to Claude Code (web) → MCP servers, transport
-**Streamable HTTP**. Confirm with `whoami`.
+**Streamable HTTP**. The URL is keyed on your GitHub login so it stays the
+same across sessions — register it **once**. Confirm with `whoami`.
 
 ## Optional overrides
 
@@ -53,6 +57,7 @@ Set these in the consumer hook before the curl pipe:
 | Env | Default | Meaning |
 |---|---|---|
 | `GITHUB_MCP_ENV` | `staging` | `staging` or `prod` |
-| `GITHUB_MCP_BIND_PORT` | `18765` | local serve port |
-| `GITHUB_MCP_PIN_TAG` | latest release | pin to a specific tag, e.g. `v0.0.5`. **Pre-`v0.0.5` tags lack the embed and will 401 against auth-worker** (#25) |
+| `GITHUB_MCP_PIN_TAG` | latest release | pin to a specific tag, e.g. `v0.0.6`. **Pre-`v0.0.6` tags lack the `relay` subcommand and will be rejected by `install-mcp.sh`** (#27) |
 | `GITHUB_MCP_INTERNAL_SHARED_SECRET` | (embed) | advanced: override the embedded secret (e.g. testing against your own auth-worker fork) |
+
+> Removed in v0.0.6: `GITHUB_MCP_BIND_PORT` (cloudflared 用 local port; relay は outbound WS のみ).

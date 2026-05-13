@@ -3,9 +3,10 @@
 # https://github.com/ippoan/github-mcp-server-rs
 #
 # Purpose:
-#   Make the `github-mcp-server-rs` MCP server available to a Claude Code on
-#   the web session from any consumer repo, exposed via cloudflared so that
-#   Claude on the web can reach it over Streamable HTTP.
+#   Make the `github-mcp-server-rs` MCP server available to a Claude Code on the
+#   web session from any consumer repo. Outbound WebSocket relay against
+#   auth-worker `mcp(-staging).ippoan.org` (issue #27, paired with
+#   ippoan/auth-worker#117) — no cloudflared, no inbound port.
 #
 # Consumer usage — drop this into the consumer repo's
 # `.claude/hooks/session-start.sh`:
@@ -22,8 +23,7 @@
 #
 # Optional env (with defaults):
 #   GITHUB_MCP_ENV          staging|prod                          (default: staging)
-#   GITHUB_MCP_BIND_PORT    local serve port                       (default: 18765)
-#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.5)          (default: latest)
+#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.6)         (default: latest)
 #
 # Override (advanced; 通常は不要):
 #   GITHUB_MCP_INTERNAL_SHARED_SECRET — embed されている値を上書きしたい時のみ
@@ -31,11 +31,12 @@
 #
 # On success:
 #   - binary installed at  $HOME/.local/bin/github-mcp-server-rs
-#   - cloudflared running, MCP URL written to:
+#   - relay running (outbound WS to mcp(-staging).ippoan.org)
+#   -固定 MCP URL written to:
 #       $CLAUDE_PROJECT_DIR/.claude/mcp-state/mcp-url
 #     and exported as $GITHUB_MCP_URL via $CLAUDE_ENV_FILE.
 #
-# Re-running is safe: existing binary / token cache / running serve are reused.
+# Re-running is safe: existing binary / token cache / running relay are reused.
 
 set -euo pipefail
 
@@ -47,12 +48,16 @@ fi
 
 REPO="ippoan/github-mcp-server-rs"
 ENV_NAME="${GITHUB_MCP_ENV:-staging}"
-BIND_PORT="${GITHUB_MCP_BIND_PORT:-18765}"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 INSTALL_DIR="$HOME/.local/bin"
 STATE_DIR="$PROJECT_DIR/.claude/mcp-state"
 mkdir -p "$INSTALL_DIR" "$STATE_DIR"
+
+# Cleanup state files from old cloudflared-based versions (issue #27 hard-cut).
+rm -f "$STATE_DIR/serve.pid" "$STATE_DIR/serve.log" \
+      "$STATE_DIR/cloudflared.pid" "$STATE_DIR/cloudflared.log" \
+      "$STATE_DIR/url" 2>/dev/null || true
 
 # Make $HOME/.local/bin reachable for the rest of the session.
 case ":$PATH:" in
@@ -105,20 +110,15 @@ if [ ! -x "$BIN" ]; then
 fi
 echo "[install-mcp] binary: $($BIN --version 2>/dev/null || echo "$BIN")" >&2
 
-# ─── 2. install cloudflared (for HTTPS tunnel) ────────────────────────────────
-if ! command -v cloudflared >/dev/null 2>&1; then
-  echo "[install-mcp] installing cloudflared..." >&2
-  curl -sSfL \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
-    -o "$INSTALL_DIR/cloudflared"
-  chmod +x "$INSTALL_DIR/cloudflared"
+# ─── 2. binary は relay subcommand を持つか? (古い tag の pin 対策) ──────────
+if ! "$BIN" relay --help >/dev/null 2>&1; then
+  echo "[install-mcp] ERROR: installed binary does not support 'relay' subcommand." >&2
+  echo "[install-mcp]        Required: v0.0.6 or later (issue #27)." >&2
+  echo "[install-mcp]        If GITHUB_MCP_PIN_TAG is set, bump it to v0.0.6+." >&2
+  exit 1
 fi
 
 # ─── 3. device-flow auth if no token cache yet ────────────────────────────────
-# INTERNAL_SHARED_SECRET は v0.0.5+ release binary に embed 済みなので、ここで
-# 検証する必要は無い (#25)。env で override したい advanced ユーザは serve
-# 起動時に child process が inherit するので追加の処理不要。
-
 TOKEN_FILE="$HOME/.config/github-mcp-server-rs/token-${ENV_NAME}.json"
 if [ ! -f "$TOKEN_FILE" ]; then
   echo "" >&2
@@ -130,67 +130,42 @@ if [ ! -f "$TOKEN_FILE" ]; then
   "$BIN" auth --env "$ENV_NAME" >&2
 fi
 
-# ─── 4. (re)start serve in the background ─────────────────────────────────────
-start_serve() {
-  local allowed_hosts="$1"
-  if [ -f "$STATE_DIR/serve.pid" ]; then
-    local old_pid
-    old_pid="$(cat "$STATE_DIR/serve.pid" 2>/dev/null || true)"
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      kill "$old_pid" 2>/dev/null || true
-      sleep 1
-    fi
+# ─── 4. (re)start relay in the background ─────────────────────────────────────
+if [ -f "$STATE_DIR/relay.pid" ]; then
+  old_pid="$(cat "$STATE_DIR/relay.pid" 2>/dev/null || true)"
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    kill "$old_pid" 2>/dev/null || true
+    sleep 1
   fi
-  nohup "$BIN" serve --env "$ENV_NAME" \
-    --bind "127.0.0.1:$BIND_PORT" \
-    --allowed-hosts "$allowed_hosts" \
-    > "$STATE_DIR/serve.log" 2>&1 &
-  echo $! > "$STATE_DIR/serve.pid"
-}
+fi
 
-start_serve "localhost,127.0.0.1"
+: > "$STATE_DIR/relay.log"
+nohup "$BIN" relay --env "$ENV_NAME" --state-dir "$STATE_DIR" \
+  > "$STATE_DIR/relay.log" 2>&1 &
+echo $! > "$STATE_DIR/relay.pid"
 
-# Wait for serve to bind the port.
+# ─── 5. wait for the relay to write the public URL state file ────────────────
+# binary は `--state-dir` の `<dir>/url` に固定 URL を書いてから WS connect を始める。
+# install-mcp.sh はその file 出現を待つ。30s で諦める。
 ready=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if (echo > "/dev/tcp/127.0.0.1/$BIND_PORT") 2>/dev/null; then
+for _ in $(seq 1 30); do
+  if [ -s "$STATE_DIR/url" ]; then
     ready=1; break
+  fi
+  if ! kill -0 "$(cat "$STATE_DIR/relay.pid")" 2>/dev/null; then
+    echo "[install-mcp] ERROR: relay process died during startup. Log:" >&2
+    tail -n 50 "$STATE_DIR/relay.log" >&2 || true
+    exit 1
   fi
   sleep 1
 done
 if [ "$ready" != "1" ]; then
-  echo "[install-mcp] ERROR: serve did not bind 127.0.0.1:$BIND_PORT" >&2
-  tail -n 50 "$STATE_DIR/serve.log" >&2 || true
+  echo "[install-mcp] ERROR: relay did not produce $STATE_DIR/url within 30s." >&2
+  tail -n 50 "$STATE_DIR/relay.log" >&2 || true
   exit 1
 fi
 
-# ─── 5. start cloudflared & extract the trycloudflare URL ────────────────────
-: > "$STATE_DIR/cloudflared.log"
-nohup cloudflared tunnel --no-autoupdate \
-  --url "http://127.0.0.1:$BIND_PORT" \
-  > "$STATE_DIR/cloudflared.log" 2>&1 &
-echo $! > "$STATE_DIR/cloudflared.pid"
-
-TUNNEL_URL=""
-for _ in $(seq 1 60); do
-  TUNNEL_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' \
-                  "$STATE_DIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-  [ -n "$TUNNEL_URL" ] && break
-  sleep 1
-done
-
-if [ -z "$TUNNEL_URL" ]; then
-  echo "[install-mcp] ERROR: failed to extract cloudflared tunnel URL" >&2
-  tail -n 50 "$STATE_DIR/cloudflared.log" >&2 || true
-  exit 1
-fi
-
-# ─── 6. restart serve with the trycloudflare host in --allowed-hosts ──────────
-TUNNEL_HOST="${TUNNEL_URL#https://}"
-start_serve "localhost,127.0.0.1,$TUNNEL_HOST"
-
-# ─── 7. publish the URL for the session ───────────────────────────────────────
-MCP_URL="$TUNNEL_URL/mcp"
+MCP_URL="$(cat "$STATE_DIR/url")"
 echo "$MCP_URL" > "$STATE_DIR/mcp-url"
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export GITHUB_MCP_URL=\"$MCP_URL\"" >> "$CLAUDE_ENV_FILE"
@@ -198,9 +173,11 @@ fi
 
 cat >&2 <<EOF
 
-[install-mcp] ✓ github-mcp-server-rs is ready.
-[install-mcp]   MCP URL (Streamable HTTP): $MCP_URL
-[install-mcp]   Add it to Claude Code's MCP settings on the web, or it is also
-[install-mcp]   exported as \$GITHUB_MCP_URL and written to:
+[install-mcp] ✓ github-mcp-server-rs is ready (relay mode).
+[install-mcp]   MCP URL (Streamable HTTP via auth-worker WS relay): $MCP_URL
+[install-mcp]   This URL is **stable** — register it once in Claude Code Web's MCP
+[install-mcp]   settings, no need to update per-session.
+[install-mcp]   Also exported as \$GITHUB_MCP_URL and written to:
 [install-mcp]     $STATE_DIR/mcp-url
+[install-mcp]   Relay log: $STATE_DIR/relay.log
 EOF

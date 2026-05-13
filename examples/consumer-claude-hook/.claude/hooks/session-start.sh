@@ -24,8 +24,7 @@
 #
 # Optional overrides (export before the curl pipe if you need to):
 #   GITHUB_MCP_ENV          staging|prod   (default: staging)
-#   GITHUB_MCP_BIND_PORT    18765
-#   GITHUB_MCP_PIN_TAG      v0.0.5         (pin to a specific release; v0.0.5+ 必須)
+#   GITHUB_MCP_PIN_TAG      v0.0.6         (pin to a specific release; v0.0.6+ 必須 — relay subcommand)
 #
 # Advanced override (embed を上書きしたい時のみ):
 #   GITHUB_MCP_INTERNAL_SHARED_SECRET — 自分の auth-worker fork に当てる dev 用途等

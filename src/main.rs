@@ -18,13 +18,16 @@ mod auth;
 mod config;
 mod introspect;
 mod mcp_server;
+mod relay;
 mod token_cache;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 use crate::mcp_server::{GithubContext, GithubMcp};
 use rmcp::transport::streamable_http_server::{
@@ -32,6 +35,7 @@ use rmcp::transport::streamable_http_server::{
 };
 
 use crate::config::{AuthEnv, Config};
+use crate::relay::RelayContext;
 use crate::token_cache::TokenSet;
 
 #[derive(Parser, Debug)]
@@ -47,6 +51,11 @@ struct Cli {
     /// Override auth-worker base URL (e.g. https://xxx.trycloudflare.com for wt-quick)
     #[arg(long, global = true)]
     auth_base: Option<String>,
+
+    /// Override MCP relay base URL (default: https://mcp(-staging).ippoan.org from env).
+    /// 開発時に local mock auth-worker を叩く時用 (例: ws://127.0.0.1:18099)。
+    #[arg(long, global = true)]
+    relay_base: Option<String>,
 
     /// auth-worker INTERNAL_SHARED_SECRET。通常は release binary に build-time embed
     /// されているので未指定で OK。上書きしたい時のみ CLI or env で指定。
@@ -82,21 +91,24 @@ enum Command {
     Logout,
     /// Show effective config (URLs, cache path) without secrets
     Doctor,
-    /// Run MCP server (Streamable HTTP transport) on the given bind address.
-    /// Requires a cached token (run `auth` first). Loads github_token via
-    /// introspect at startup and caches in-memory for the process lifetime.
-    Serve {
-        /// Bind address (host:port)
-        #[arg(long, default_value = "127.0.0.1:8765")]
-        bind: String,
-        /// Allowed Host header values (comma-separated). Default: loopback only.
-        /// Set explicitly for public exposure (cloudflared tunnel etc.).
-        #[arg(long, value_delimiter = ',')]
-        allowed_hosts: Option<Vec<String>>,
-        /// Use stateless JSON response mode (no SSE framing). Recommended for
-        /// simple request/response tools.
+    /// Run MCP server as an outbound WebSocket relay client (issue #27).
+    /// `wss://mcp(-staging).ippoan.org/u/<github_login>/connect` に接続し、
+    /// auth-worker `McpSession` Durable Object に長寿命 WS を張る。
+    /// Claude Code Web からは `https://mcp(-staging).ippoan.org/u/<login>/mcp` に POST
+    /// するだけで、auth-worker → DO → WS frame として本 binary に届く。
+    /// 旧 `serve` (cloudflared 用 axum bind) は撤廃。
+    Relay {
+        /// `--user` で github_login を明示。省略時は `/mcp/introspect` で resolve。
+        /// install-mcp.sh は明示する (1 回 introspect する手間を省く)。
+        #[arg(long)]
+        user: Option<String>,
+        /// State directory (install-mcp.sh `$STATE_DIR`)。設定すると
+        /// `<state-dir>/url` に固定 URL を書き出す。
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Status sentinel (install-mcp.sh が grep する) を stdout に出力する。
         #[arg(long, default_value_t = true)]
-        json_response: bool,
+        print_status: bool,
     },
 }
 
@@ -105,10 +117,15 @@ fn build_config(cli: &Cli) -> Result<Config> {
         .auth_base
         .clone()
         .unwrap_or_else(|| cli.env.default_base().to_string());
+    let relay_base = cli
+        .relay_base
+        .clone()
+        .unwrap_or_else(|| cli.env.default_relay_base().to_string());
     let internal_shared_secret = resolve_internal_secret(cli.internal_shared_secret.as_deref());
     Ok(Config {
         env: cli.env,
         auth_base,
+        relay_base,
         internal_shared_secret,
         client_id: cli.client_id.clone(),
         scope: cli.scope.clone(),
@@ -214,12 +231,14 @@ async fn run_whoami(client: &Client, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_serve(
+/// `relay` subcommand: outbound WS で auth-worker `mcp(-staging).ippoan.org` に接続して
+/// MCP server を提供する (issue #27)。
+async fn run_relay(
     client: &Client,
     cfg: &Config,
-    bind: &str,
-    allowed_hosts: Option<Vec<String>>,
-    json_response: bool,
+    user: Option<String>,
+    state_dir: Option<PathBuf>,
+    print_status: bool,
 ) -> Result<()> {
     let path = cfg.token_cache_path()?;
     let mut token = TokenSet::load(&path)?.ok_or_else(|| {
@@ -243,6 +262,19 @@ async fn run_serve(
         active.github_login, active.scope
     );
 
+    // --user 明示が introspect 結果と矛盾していたら fail fast (path mismatch で WS 401 確定)
+    let login = match user {
+        Some(u) if u != active.github_login => {
+            return Err(anyhow!(
+                "--user {} does not match introspected github_login={}",
+                u,
+                active.github_login
+            ));
+        }
+        Some(u) => u,
+        None => active.github_login.clone(),
+    };
+
     let ctx = Arc::new(GithubContext {
         github_token: active.github_token,
         github_login: active.github_login,
@@ -250,42 +282,37 @@ async fn run_serve(
         client: client.clone(),
     });
 
-    // rmcp StreamableHttpService の factory は session ごとに呼ばれる
+    // rmcp StreamableHttpService — relay では axum router に nest せず、
+    // bridge.rs から直接 tower::Service として呼ぶ。
     let factory_ctx = ctx.clone();
-    let service: StreamableHttpService<GithubMcp, LocalSessionManager> = StreamableHttpService::new(
+    let svc: StreamableHttpService<GithubMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(GithubMcp::new(factory_ctx.clone())),
         Default::default(),
         StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
-            .with_json_response(json_response)
-            .with_allowed_hosts(allowed_hosts.unwrap_or_else(|| {
-                vec![
-                    "localhost".into(),
-                    "127.0.0.1".into(),
-                    "::1".into(),
-                    // bind した host:port もデフォで許可しておく
-                    bind.to_string(),
-                ]
-            })),
+            .with_json_response(true),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind {bind}"))?;
-    let addr = listener.local_addr()?;
-    println!(
-        "⇒ MCP server listening on http://{addr}/mcp (env={})",
-        cfg.env.as_str()
-    );
-    println!("   Register URL in Claude Code Web → MCP connector.");
-    println!(
-        "   ※ Ctrl-C で停止。token 期限は {} (Unix epoch)。",
-        token.expires_at
-    );
+    if print_status {
+        println!(
+            "⇒ MCP relay starting (env={}, user={})",
+            cfg.env.as_str(),
+            login
+        );
+    }
 
-    axum::serve(listener, router).await.context("axum serve")?;
-    Ok(())
+    let relay_ctx = RelayContext {
+        cfg: Arc::new(cfg.clone()),
+        http: client.clone(),
+        login,
+        jwt: Arc::new(RwLock::new(token)),
+        jwt_cache_path: path,
+        svc,
+        state_dir,
+        print_status,
+    };
+
+    relay::run_relay(relay_ctx).await
 }
 
 fn run_logout(cfg: &Config) -> Result<()> {
@@ -300,6 +327,7 @@ fn run_doctor(cfg: &Config) -> Result<()> {
     let cached = TokenSet::load(&cache)?;
     println!("env:              {}", cfg.env.as_str());
     println!("auth_base:        {}", cfg.auth_base);
+    println!("relay_base:       {}", cfg.relay_base);
     println!("client_id:        {}", cfg.client_id);
     println!("scope:            {}", cfg.scope);
     println!(
@@ -346,10 +374,10 @@ async fn main() -> Result<()> {
         Command::Whoami => run_whoami(&client, &cfg).await,
         Command::Logout => run_logout(&cfg),
         Command::Doctor => run_doctor(&cfg),
-        Command::Serve {
-            bind,
-            allowed_hosts,
-            json_response,
-        } => run_serve(&client, &cfg, &bind, allowed_hosts, json_response).await,
+        Command::Relay {
+            user,
+            state_dir,
+            print_status,
+        } => run_relay(&client, &cfg, user, state_dir, print_status).await,
     }
 }
