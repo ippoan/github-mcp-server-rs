@@ -3,7 +3,8 @@
 GitHub MCP server (Model Context Protocol) — `auth-worker` の **Device Authorization Grant (RFC 8628)** クライアント実装。
 Claude Code / Claude Desktop などの MCP host から GitHub API を叩く用途で、`ippoan/auth-worker` の MCP OAuth Provider と組で動く。
 
-> **Status**: Phase 6 MVP — auth flow + introspect 検証のみ。実 MCP server (stdio JSON-RPC + tool definitions) は次フェーズで追加。
+> **Status**: Phase 7 — `relay` subcommand (issue #27) で outbound WebSocket relay 経由で
+> Streamable HTTP MCP server を `mcp(-staging).ippoan.org` 配下に公開。auth-worker #117 と pair。
 
 ## 動作の全体像
 
@@ -93,16 +94,35 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 | `whoami` | cache 読み → 期限切れなら refresh → introspect で github_token 取得 → GitHub `/user` 確認 |
 | `logout` | token cache を削除 |
 | `doctor` | 設定 / cache 状況をダンプ (secret 値は出さない) |
-| `serve` | MCP server (Streamable HTTP) を起動。Claude Code Web / Claude Code CLI 等の MCP client から `POST /mcp` に接続 |
+| `relay` | MCP server を outbound WebSocket relay 経由で公開 (issue #27)。`wss://mcp(-staging).ippoan.org/u/<login>/connect` に接続して auth-worker `McpSession` Durable Object と長寿命 WS を張る |
 
-## MCP server mode
+## MCP server mode (relay)
 
-`auth` でログイン済みの状態で `serve` を起動すると、`POST http://<bind>/mcp` で MCP protocol (Streamable HTTP, 2025-06-18 spec) を喋る endpoint が立ち上がる。起動時に `/mcp/introspect` を 1 回叩いて github_token を回収し、in-memory に保持。
+`v0.0.6+` から、MCP server は **outbound WebSocket relay** で公開する (issue #27、auth-worker #117 と pair)。
+旧 `serve` (cloudflared 用 axum bind) は撤廃。
+
+`auth` でログイン済みの状態で `relay` を起動すると:
+
+1. `/mcp/introspect` で github_token + github_login を 1 回回収して in-memory に保持
+2. `wss://mcp(-staging).ippoan.org/u/<github_login>/connect` に `Authorization: Bearer <mcp-jwt>` で接続
+3. auth-worker `McpSession` Durable Object と長寿命 WS を張る
+4. Claude Code Web からの `POST https://mcp(-staging).ippoan.org/u/<github_login>/mcp` は
+   auth-worker → DO → WS frame として binary に届き、`StreamableHttpService` (rmcp) で処理されて
+   逆経路で返却
 
 ```bash
-./github-mcp-server-rs serve --env staging --bind 127.0.0.1:18765
-# ⇒ MCP server listening on http://127.0.0.1:18765/mcp (env=staging)
+./github-mcp-server-rs relay --env staging
+# → MCP relay starting (env=staging, user=yhonda-ohishi)
+# → MCP relay: connecting to wss://mcp-staging.ippoan.org/u/yhonda-ohishi/connect as yhonda-ohishi
 ```
+
+### 公開 URL
+
+- Staging: `https://mcp-staging.ippoan.org/u/<github_login>/mcp`
+- Prod: `https://mcp.ippoan.org/u/<github_login>/mcp`
+
+URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 度だけ**登録すれば
+セッションをまたいで使える。
 
 ### Tools (MVP)
 
@@ -111,35 +131,40 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 | `whoami` | (なし) | `{ github_login, scope }` |
 | `list_repos` | `visibility?` ("all" / "public" / "private")、`per_page?` (1–100)、`page?` (1+) | `{ page, per_page, count, repos: [{ full_name, private, description, html_url, default_branch, language, stargazers_count, pushed_at }] }` |
 
-### Claude Code Web で使う (HTTPS tunnel 経由)
-
-Claude Code Web (claude.ai/code) の MCP connector は **HTTPS な URL** が必要。ローカル `127.0.0.1` は届かないので、`cloudflared` の Quick Tunnel で 1 コマンド公開:
+### `--state-dir` (install hook 連携用)
 
 ```bash
-# (別ターミナル) cloudflared がインストール済みなら:
-cloudflared tunnel --url http://127.0.0.1:18765
-# → "https://xxx-yyy-zzz.trycloudflare.com" が表示される
+./github-mcp-server-rs relay --env staging --state-dir /tmp/mcp
+# → /tmp/mcp/url に "https://mcp-staging.ippoan.org/u/<login>/mcp" を即時書き出し
 ```
 
-その後 Claude Code Web の設定で MCP server を追加:
+`install-mcp.sh` (`.claude/hooks/install-mcp.sh`) はこの file を待って `$GITHUB_MCP_URL`
+に export する。
 
-- URL: `https://xxx-yyy-zzz.trycloudflare.com/mcp`
-- Transport: Streamable HTTP (default)
+### Architecture (relay flow)
 
-接続後、Claude に `whoami` ツールを呼ばせて自分の github_login が返れば成功。
-
-### Allowed hosts
-
-Cloudflare 経由で公開する場合、`Host` header validation を緩めたい時は明示:
-
-```bash
-./github-mcp-server-rs serve --env staging \
-  --bind 0.0.0.0:18765 \
-  --allowed-hosts "localhost,127.0.0.1,xxx-yyy-zzz.trycloudflare.com"
+```
+[Claude Code Web]
+       │  HTTPS POST  https://mcp(-staging).ippoan.org/u/<login>/mcp
+       ▼
+[auth-worker (Workers)]
+       │  routes to DO by <login>
+       ▼
+[Durable Object: McpSession]
+       │  WebSocket frame (JSON: Frame::Req / Resp)
+       ▼
+[github-mcp-server-rs binary (outbound WS only)]
+   │  bridge.rs → StreamableHttpService<GithubMcp>
+   │  (rmcp tool_router: whoami, list_repos)
+   ▼
+[GitHub API]
 ```
 
-(`--allowed-hosts` を省略すると default = `localhost,127.0.0.1,::1` + `--bind` 値。
-cloudflared 経由だと `Host` は cloudflare ドメイン名で来るので追加が必要。)
+### Reconnect / JWT refresh
+
+- WS が closed (network / auth-worker 再起動) → exponential backoff (1s → 2s → … 最大 30s) で再接続
+- handshake が `401` を返したら `/mcp/token` (refresh_token grant) で JWT を更新して再接続
+- refresh 自体が失敗 (= refresh_token も失効) したら fatal exit。`auth` を再実行する
 
 ## Global flags
 
@@ -208,17 +233,25 @@ MCP_INTERNAL_SECRET="<staging value>" cargo build --release
 | approve 後に「Access denied」HTML | `GITHUB_MCP_USER_ALLOWLIST` に自分の login が無い (fail-closed) |
 | `whoami`: `401 — check INTERNAL_SHARED_SECRET` | (a) `doctor` の `internal_secret: (set, N chars)` を見て **N が 21 なら dev fallback** = embed が無い古い binary か `cargo run` で env 未指定。`v0.0.5+` の release binary を取り直す、または `MCP_INTERNAL_SECRET` 付きで `cargo build` (`Local development` 参照)、(b) staging/prod を取り違えていないか |
 | `whoami`: `active:false` | token が revoke / `github_token:{sub}` が KV から TTL 切れ (30d) — `auth` をやり直す |
+| `relay`: handshake が 401 で繰り返し reject (`auth rejected (401), refreshing JWT` ループ) | `MCP_JWT_SECRET` が auth-worker と binary 解釈の env で揃っていない、もしくは refresh_token も失効。`logout` → `auth` で初期化 |
+| `relay`: `network: ws connect: ...` が backoff し続ける | `mcp.ippoan.org` / `mcp-staging.ippoan.org` の DNS / TLS 問題。`curl -v https://mcp(-staging).ippoan.org/u/<login>/mcp` で疎通確認 |
+| `install-mcp.sh`: `relay did not produce $STATE_DIR/url within 30s.` | binary が起動失敗。`tail -n 50 $STATE_DIR/relay.log` を確認 (token 不足 / introspect 失敗 が大半) |
+| `install-mcp.sh`: `installed binary does not support 'relay' subcommand` | `GITHUB_MCP_PIN_TAG` が v0.0.5 以下 (cloudflared 時代の binary)。pin を `v0.0.6+` に bump する |
 
 ## アーキテクチャ
 
 ```
 src/
-├── main.rs         — CLI entry (clap)、Auth/Whoami/Logout/Doctor/Serve subcommand
-├── config.rs       — env switch (AuthEnv::{Staging,Prod})、URL 組み立て、cache path
+├── main.rs         — CLI entry (clap)、Auth/Whoami/Logout/Doctor/Relay subcommand
+├── config.rs       — env switch (AuthEnv::{Staging,Prod})、URL 組み立て、cache path、relay_base
 ├── auth.rs         — RFC 8628 device flow (start + poll + refresh)
 ├── introspect.rs   — POST /mcp/introspect → github_token 復元
 ├── token_cache.rs  — ~/.config/.../token-{env}.json への永続化 (0600 perm)
-└── mcp_server.rs   — rmcp ServerHandler 実装 + tool_router (whoami / list_repos)
+├── mcp_server.rs   — rmcp ServerHandler 実装 + tool_router (whoami / list_repos)
+└── relay/
+    ├── mod.rs      — outbound WS client + reconnect + JWT refresh (issue #27)
+    ├── frame.rs    — WS frame schema (Req / Resp / Hello, JSON over Text frame)
+    └── bridge.rs   — Frame ↔ axum::Request/Response ↔ tower::Service dispatch
 ```
 
 ## Claude Code on the web から使う (別 repo から install hook 経由)
@@ -227,21 +260,23 @@ src/
 `github-mcp-server-rs` を自動セットアップできる **再利用可能な SessionStart hook**
 (`.claude/hooks/install-mcp.sh`) を公開している。
 
-### 仕組み
+### 仕組み (v0.0.6+)
 
 ```
 consumer-repo/.claude/hooks/session-start.sh
   └─ curl https://raw.githubusercontent.com/ippoan/github-mcp-server-rs/main/.claude/hooks/install-mcp.sh | bash
        ├─ GitHub Releases から binary を download (latest or GITHUB_MCP_PIN_TAG)
        │   ※ v0.0.5+ binary は INTERNAL_SHARED_SECRET を build-time embed 済 (#25)
-       ├─ cloudflared を download
-       ├─ auth (device flow) を実行 — browser で approve
-       ├─ serve を 127.0.0.1:18765 で background 起動
-       ├─ cloudflared tunnel で公開 URL を取得
-       └─ serve を tunnel host を allowed-hosts に追加して再起動
-            ⇒ MCP URL (https://xxx.trycloudflare.com/mcp) を
+       │   ※ v0.0.6+ binary は relay subcommand を持つ (#27)
+       ├─ auth (device flow) を初回だけ実行 — browser で approve
+       ├─ relay を background 起動 (outbound WS to mcp(-staging).ippoan.org)
+       └─ relay が <state-dir>/url に固定 URL を書き出すのを待つ
+            ⇒ MCP URL (https://mcp(-staging).ippoan.org/u/<login>/mcp) を
               $GITHUB_MCP_URL & .claude/mcp-state/mcp-url に書き出す
 ```
+
+cloudflared は v0.0.6+ で **撤廃** (issue #27)。URL が固定になったので Claude Code Web 側
+登録は **1 度だけ**。
 
 ### 使い方 (consumer repo 側)
 
@@ -270,12 +305,12 @@ hook の最後にプリントされる。その URL を Claude Code (web) → MC
 | Env | Default | 用途 |
 |---|---|---|
 | `GITHUB_MCP_ENV` | `staging` | `staging` or `prod` |
-| `GITHUB_MCP_BIND_PORT` | `18765` | local serve port |
-| `GITHUB_MCP_PIN_TAG` | latest release | 再現性のため tag pin。**`v0.0.5` 以上**を指定すること (それ以前は embed が無いので 401 になる) |
+| `GITHUB_MCP_PIN_TAG` | latest release | 再現性のため tag pin。**`v0.0.6` 以上**を指定すること (それ以前は relay subcommand が無いので install-mcp.sh が fail する) |
 | `GITHUB_MCP_INTERNAL_SHARED_SECRET` | (embed) | advanced: embed されている secret を上書きしたい時のみ (例: 自分の auth-worker fork に当てる dev 用途) |
 
 > **Note**: hook は `CLAUDE_CODE_REMOTE=true` のときだけ動く。local Claude Code
 > セッションでは no-op。
+> 旧 `GITHUB_MCP_BIND_PORT` env (cloudflared 用 local port) は v0.0.6+ で **撤廃**。
 
 ## 関連
 
