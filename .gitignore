@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bk
+.vscode/
+.idea/
+*.swp
+
+# local secret / cred backups
+.env
+.env.local
+.dev.vars
+
+# token cache (also lives in ~/.config but in case anyone runs with HOME=$PWD)
+config/
