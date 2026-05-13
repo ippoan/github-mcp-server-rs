@@ -284,13 +284,24 @@ async fn run_relay(
 
     // rmcp StreamableHttpService — relay では axum router に nest せず、
     // bridge.rs から直接 tower::Service として呼ぶ。
+    //
+    // allowed_hosts (issue #29): auth-worker が forward する Host header は
+    // `mcp(-staging).ippoan.org` (or --relay-base override 時の任意 host) なので、
+    // default の loopback only だと 403 "Host header is not allowed" で reject される。
+    // relay_base から host を derive して許可リストに追加する。
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Some(host) = relay_host_from_base(&cfg.relay_base) {
+        allowed_hosts.push(host);
+    }
+
     let factory_ctx = ctx.clone();
     let svc: StreamableHttpService<GithubMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(GithubMcp::new(factory_ctx.clone())),
         Default::default(),
         StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
-            .with_json_response(true),
+            .with_json_response(true)
+            .with_allowed_hosts(allowed_hosts),
     );
 
     if print_status {
@@ -313,6 +324,24 @@ async fn run_relay(
     };
 
     relay::run_relay(relay_ctx).await
+}
+
+/// `https://mcp-staging.ippoan.org` / `wss://mcp.ippoan.org` / `http://127.0.0.1:18099` 等から
+/// `host[:port]` を抽出する (rmcp `with_allowed_hosts` に渡す用)。scheme prefix が
+/// 認識できなければ None。trailing `/path` も削除する。
+fn relay_host_from_base(base: &str) -> Option<String> {
+    let trimmed = base.trim();
+    let after_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("wss://"))
+        .or_else(|| trimmed.strip_prefix("ws://"))?;
+    let host = after_scheme.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 fn run_logout(cfg: &Config) -> Result<()> {
@@ -379,5 +408,63 @@ async fn main() -> Result<()> {
             state_dir,
             print_status,
         } => run_relay(&client, &cfg, user, state_dir, print_status).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay_host_from_base;
+
+    #[test]
+    fn relay_host_https_prod() {
+        assert_eq!(
+            relay_host_from_base("https://mcp.ippoan.org"),
+            Some("mcp.ippoan.org".into())
+        );
+    }
+
+    #[test]
+    fn relay_host_https_staging_with_trailing_slash() {
+        assert_eq!(
+            relay_host_from_base("https://mcp-staging.ippoan.org/"),
+            Some("mcp-staging.ippoan.org".into())
+        );
+    }
+
+    #[test]
+    fn relay_host_wss_passthrough() {
+        assert_eq!(
+            relay_host_from_base("wss://mcp.ippoan.org/u/x/connect"),
+            Some("mcp.ippoan.org".into())
+        );
+    }
+
+    #[test]
+    fn relay_host_http_with_port() {
+        assert_eq!(
+            relay_host_from_base("http://127.0.0.1:18099"),
+            Some("127.0.0.1:18099".into())
+        );
+    }
+
+    #[test]
+    fn relay_host_ws_with_port_and_path() {
+        assert_eq!(
+            relay_host_from_base("ws://localhost:8080/u/dev/connect"),
+            Some("localhost:8080".into())
+        );
+    }
+
+    #[test]
+    fn relay_host_unknown_scheme_returns_none() {
+        assert_eq!(relay_host_from_base("ftp://nope"), None);
+        assert_eq!(relay_host_from_base("mcp.ippoan.org"), None);
+        assert_eq!(relay_host_from_base(""), None);
+    }
+
+    #[test]
+    fn relay_host_empty_after_scheme_returns_none() {
+        assert_eq!(relay_host_from_base("https://"), None);
+        assert_eq!(relay_host_from_base("https:///path"), None);
     }
 }
