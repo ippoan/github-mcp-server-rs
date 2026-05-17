@@ -168,13 +168,30 @@ if ! "$BIN" relay --help >/dev/null 2>&1; then
 fi
 
 # ─── 3. device-flow auth if no token cache yet ────────────────────────────────
+# CCoW (Claude Code on the web) containers are ephemeral: $HOME is wiped on
+# reclaim, so the local token cache file disappears too — every new container
+# would otherwise re-prompt for device-flow auth. To make a fresh container
+# bootstrap silently, the user can pre-stage the cached token JSON via the
+# env var $GITHUB_MCP_TOKEN_JSON (registered as a CCoW Setup-script secret).
+# The auth-worker refresh token in that JSON is long-lived (~30 days), so the
+# user just rotates the secret once a month, not once per session.
 TOKEN_FILE="$HOME/.config/github-mcp-server-rs/token-${ENV_NAME}.json"
+if [ ! -f "$TOKEN_FILE" ] && [ -n "${GITHUB_MCP_TOKEN_JSON:-}" ]; then
+  echo "[install-mcp] hydrating $TOKEN_FILE from \$GITHUB_MCP_TOKEN_JSON" >&2
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  printf '%s' "$GITHUB_MCP_TOKEN_JSON" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+fi
 if [ ! -f "$TOKEN_FILE" ]; then
   echo "" >&2
   echo "[install-mcp] ───── device authorization required (env=$ENV_NAME) ─────" >&2
   echo "[install-mcp] OPEN the verification_uri_complete URL printed below in a" >&2
   echo "[install-mcp] browser, sign in with GitHub, and Approve.  The hook will" >&2
   echo "[install-mcp] block until polling completes." >&2
+  echo "[install-mcp]" >&2
+  echo "[install-mcp] Tip: to skip this prompt on future fresh containers, copy" >&2
+  echo "[install-mcp]   $TOKEN_FILE" >&2
+  echo "[install-mcp] into a CCoW Setup-script secret named GITHUB_MCP_TOKEN_JSON." >&2
   echo "" >&2
   "$BIN" auth --env "$ENV_NAME" >&2
 fi

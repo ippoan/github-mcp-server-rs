@@ -56,13 +56,20 @@ cargo test --all-features --no-run --locked
 # approve the device code in a browser.
 ENV_NAME="${GITHUB_MCP_ENV:-staging}"
 TOKEN_FILE="$HOME/.config/github-mcp-server-rs/token-${ENV_NAME}.json"
-if [ -f "$TOKEN_FILE" ]; then
+# Auto-start when either a cached token exists on disk (within-container re-run)
+# or a hydration env var is present (fresh CCoW container — install-mcp.sh
+# will write the env var into $TOKEN_FILE before invoking the binary).
+if [ -f "$TOKEN_FILE" ] || [ -n "${GITHUB_MCP_TOKEN_JSON:-}" ]; then
   echo "[session-start] starting MCP relay (env=$ENV_NAME)..." >&2
   bash "$(dirname "$0")/install-mcp.sh" \
     || echo "[session-start] WARN: install-mcp.sh failed; relay not started" >&2
 else
-  echo "[session-start] MCP relay not auto-started: no cached token at $TOKEN_FILE." >&2
+  echo "[session-start] MCP relay not auto-started: no cached token at $TOKEN_FILE" >&2
+  echo "[session-start]   and \$GITHUB_MCP_TOKEN_JSON not set." >&2
   echo "[session-start]   Bootstrap once with: bash .claude/hooks/install-mcp.sh" >&2
+  echo "[session-start]   then copy the resulting $TOKEN_FILE into a CCoW" >&2
+  echo "[session-start]   Setup-script secret named GITHUB_MCP_TOKEN_JSON for" >&2
+  echo "[session-start]   silent bootstrap on future fresh containers." >&2
 fi
 
 echo "[session-start] done." >&2
