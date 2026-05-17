@@ -5,6 +5,7 @@
 //! `+` operator で合成される (rmcp::ToolRouter は `Add` を実装)。
 
 pub mod actions;
+pub mod branches;
 pub mod commits;
 pub mod issues;
 pub mod logs;
