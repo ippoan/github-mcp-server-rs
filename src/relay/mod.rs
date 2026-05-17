@@ -9,8 +9,13 @@
 //! - **stateless 1-req-1-resp**: WS frame は `Req`/`Resp`/`Hello` の 3 種のみ。SSE / cancellation
 //!   は frame v2 で扱う (本 plan §設計判断)。
 //! - **同一 user 1 接続**: auth-worker 側が新 WS upgrade で旧 WS を `close(1000, "replaced")`
-//!   する。binary 側は close を受けたら exponential backoff で再接続。
-//! - **JWT refresh**: handshake が 401 を返したら `auth::refresh()` で更新して再接続。
+//!   する。
+//! - **控えめな reconnect (issue #30)**: CF が WS を idle close する度に aggressive に
+//!   reconnect すると auth-worker `handleBridge` の stale-WS race を誘発する。binary は
+//!   - clean close を 1 回受けたら 5s cooldown で 1 回だけ reconnect、続けて close されたら
+//!     `Ok(())` で exit (install-mcp.sh が次セッション spawn 時に respawn する)。
+//!   - network error は 3 回連続で `Err` exit (1s → 2s backoff)。
+//! - **JWT refresh**: handshake が 401 を返したら `auth::refresh()` で更新して即時再接続。
 //!   `refresh` 自体が失敗したら fail fast (caller = install-mcp.sh が `auth` 再実行を案内)。
 //! - **複数 in-flight**: 受信 frame ごとに `tokio::spawn`、応答は mpsc 経由で writer task に集約。
 //!   ping は同じ writer task から pong で返す。
@@ -89,7 +94,67 @@ impl std::fmt::Display for RelayError {
     }
 }
 
-/// 本 binary の relay loop entry。Ctrl-C / SIGTERM で停止するまで再接続を続ける。
+/// 1 回 clean close を受けてから cooldown するまでの間隔。
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+/// network error 連続発生で諦めるまでの試行回数 (本数自体は cap、間隔は 1s, 2s)。
+const MAX_NETWORK_RETRIES: u32 = 3;
+
+/// `run_relay` の状態遷移を input event だけで決める純関数 (テスト容易性のため抽出)。
+#[derive(Debug, PartialEq, Eq)]
+enum LoopAction {
+    /// `tokio::time::sleep(d)` してから次の周回へ。
+    Reconnect(Duration),
+    /// 即時再接続 (sleep skip)。
+    ReconnectImmediate,
+    /// `Ok(())` で関数を抜ける (install-mcp.sh が次セッションで respawn する)。
+    ExitOk,
+    /// `Err` で関数を抜ける。
+    ExitErr,
+}
+
+/// loop 内の連続イベントカウンタ。
+#[derive(Default, Debug)]
+struct LoopState {
+    clean_close_streak: u32,
+    network_error_streak: u32,
+}
+
+impl LoopState {
+    fn on_clean_close(&mut self) -> LoopAction {
+        self.clean_close_streak += 1;
+        self.network_error_streak = 0;
+        if self.clean_close_streak >= 2 {
+            LoopAction::ExitOk
+        } else {
+            LoopAction::Reconnect(RECONNECT_COOLDOWN)
+        }
+    }
+
+    fn on_auth_rejected(&mut self) -> LoopAction {
+        self.clean_close_streak = 0;
+        self.network_error_streak = 0;
+        LoopAction::ReconnectImmediate
+    }
+
+    fn on_network_error(&mut self) -> LoopAction {
+        self.network_error_streak += 1;
+        self.clean_close_streak = 0;
+        if self.network_error_streak >= MAX_NETWORK_RETRIES {
+            LoopAction::ExitErr
+        } else {
+            // 1st = 1s, 2nd = 2s
+            let backoff = Duration::from_secs(1u64 << (self.network_error_streak - 1));
+            LoopAction::Reconnect(backoff)
+        }
+    }
+}
+
+/// 本 binary の relay loop entry。
+///
+/// 終了条件 (issue #30):
+/// - clean close を 2 回連続で受けたら `Ok(())` (install-mcp.sh が respawn する)
+/// - network error が 3 回連続したら `Err`
+/// - protocol / fatal は即 `Err`
 pub async fn run_relay<S, RB>(ctx: RelayContext<S>) -> Result<()>
 where
     S: Service<HttpRequest<Body>, Response = HttpResponse<RB>, Error = Infallible>
@@ -101,9 +166,6 @@ where
     RB: http_body::Body<Data = Bytes> + Send + 'static,
     RB::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-
     // 1 周目だけ public URL を state file に書く (install-mcp.sh が読む)
     if let Some(dir) = &ctx.state_dir {
         let public = ctx.cfg.relay_public_url(&ctx.login);
@@ -116,6 +178,7 @@ where
         }
     }
 
+    let mut state = LoopState::default();
     let mut first_success_announced = false;
 
     loop {
@@ -124,27 +187,63 @@ where
             println!("→ MCP relay: connecting to {connect_url} as {}", ctx.login);
         }
 
-        match connect_and_serve(&ctx).await {
+        let result = connect_and_serve(&ctx).await;
+
+        // 最初の Ok (= 1 セッション完走) で sentinel を 1 度だけ出す
+        if result.is_ok() && !first_success_announced && ctx.print_status {
+            println!("✓ MCP relay: connected (first session)");
+            first_success_announced = true;
+        }
+
+        let action = match result {
             Ok(()) => {
+                let action = state.on_clean_close();
                 if ctx.print_status {
-                    println!("✓ MCP relay: connection closed cleanly, will reconnect");
+                    match action {
+                        LoopAction::ExitOk => println!(
+                            "✓ MCP relay: clean close x{} — exiting (install-mcp.sh respawns next session)",
+                            state.clean_close_streak
+                        ),
+                        LoopAction::Reconnect(d) => println!(
+                            "✓ MCP relay: connection closed cleanly, reconnecting in {d:?}"
+                        ),
+                        _ => {}
+                    }
                 }
-                backoff = Duration::from_secs(1);
+                action
             }
             Err(RelayError::AuthRejected) => {
                 if ctx.print_status {
                     eprintln!("⚠ MCP relay: WS handshake rejected (401), refreshing JWT");
                 }
                 refresh_jwt(&ctx).await.context("JWT refresh")?;
-                backoff = Duration::from_secs(1);
-                // 即時再接続 (sleep skip)
-                continue;
+                state.on_auth_rejected()
             }
             Err(RelayError::Network(e)) => {
-                tracing::warn!("relay network error: {e}, backing off {:?}", backoff);
-                if ctx.print_status {
-                    eprintln!("⚠ MCP relay: network error ({e}), retry in {:?}", backoff);
+                let action = state.on_network_error();
+                match action {
+                    LoopAction::ExitErr => {
+                        return Err(anyhow!(
+                            "relay: {MAX_NETWORK_RETRIES} consecutive network errors, last: {e}"
+                        ));
+                    }
+                    LoopAction::Reconnect(d) => {
+                        tracing::warn!(
+                            "relay network error: {e}, retry in {:?} ({}/{})",
+                            d,
+                            state.network_error_streak,
+                            MAX_NETWORK_RETRIES
+                        );
+                        if ctx.print_status {
+                            eprintln!(
+                                "⚠ MCP relay: network error ({e}), retry in {:?} ({}/{})",
+                                d, state.network_error_streak, MAX_NETWORK_RETRIES
+                            );
+                        }
+                    }
+                    _ => {}
                 }
+                action
             }
             Err(RelayError::Protocol(e)) => {
                 // proto mismatch は再接続しても直らない (binary を update する必要がある)。
@@ -153,17 +252,18 @@ where
             Err(RelayError::Fatal(e)) => {
                 return Err(anyhow!("relay fatal: {e}"));
             }
-        }
+        };
 
-        // 1 周目の成功通知 (install-mcp.sh が grep)
-        if !first_success_announced && ctx.print_status {
-            // ここに来た時点で connect_and_serve は Ok を返している
-            println!("✓ MCP relay: connected (first session)");
-            first_success_announced = true;
+        match action {
+            LoopAction::Reconnect(d) => tokio::time::sleep(d).await,
+            LoopAction::ReconnectImmediate => {}
+            LoopAction::ExitOk => return Ok(()),
+            LoopAction::ExitErr => {
+                // Network error 用の ExitErr は上の Err(RelayError::Network) arm で
+                // 直接 return しているのでここには来ない。defensive。
+                return Err(anyhow!("relay: exit on unrecoverable error"));
+            }
         }
-
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -473,5 +573,69 @@ mod tests {
     #[test]
     fn classify_close_none_is_none() {
         assert!(classify_close(None).is_none());
+    }
+
+    // ─── LoopState transitions (issue #30) ───────────────────────────────
+
+    #[test]
+    fn loop_state_first_clean_close_reconnects_with_cooldown() {
+        let mut s = LoopState::default();
+        assert_eq!(s.on_clean_close(), LoopAction::Reconnect(RECONNECT_COOLDOWN));
+        assert_eq!(s.clean_close_streak, 1);
+    }
+
+    #[test]
+    fn loop_state_second_clean_close_exits_ok() {
+        let mut s = LoopState::default();
+        let _ = s.on_clean_close();
+        assert_eq!(s.on_clean_close(), LoopAction::ExitOk);
+    }
+
+    #[test]
+    fn loop_state_auth_rejected_resets_streaks_and_reconnects_immediately() {
+        let mut s = LoopState::default();
+        let _ = s.on_clean_close();
+        let _ = s.on_network_error();
+        assert_eq!(s.on_auth_rejected(), LoopAction::ReconnectImmediate);
+        assert_eq!(s.clean_close_streak, 0);
+        assert_eq!(s.network_error_streak, 0);
+    }
+
+    #[test]
+    fn loop_state_network_error_backoff_then_exit() {
+        let mut s = LoopState::default();
+        assert_eq!(
+            s.on_network_error(),
+            LoopAction::Reconnect(Duration::from_secs(1))
+        );
+        assert_eq!(
+            s.on_network_error(),
+            LoopAction::Reconnect(Duration::from_secs(2))
+        );
+        assert_eq!(s.on_network_error(), LoopAction::ExitErr);
+    }
+
+    #[test]
+    fn loop_state_clean_close_clears_network_streak() {
+        let mut s = LoopState::default();
+        let _ = s.on_network_error();
+        let _ = s.on_network_error();
+        let _ = s.on_clean_close();
+        assert_eq!(s.network_error_streak, 0);
+        // Subsequent network error は streak=1 から再カウント
+        assert_eq!(
+            s.on_network_error(),
+            LoopAction::Reconnect(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn loop_state_network_error_clears_clean_close_streak() {
+        let mut s = LoopState::default();
+        let _ = s.on_clean_close();
+        let _ = s.on_network_error();
+        assert_eq!(s.clean_close_streak, 0);
+        // Next clean close は streak=1 から、即 ExitOk にはならない
+        assert_eq!(s.on_clean_close(), LoopAction::Reconnect(RECONNECT_COOLDOWN));
     }
 }
