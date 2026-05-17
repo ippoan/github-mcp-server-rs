@@ -51,7 +51,12 @@ use crate::token_cache::TokenSet;
 const VERSION: &str = if env!("BUILD_RELEASE_TAG").is_empty() {
     env!("CARGO_PKG_VERSION")
 } else {
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("BUILD_RELEASE_TAG"), ")")
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("BUILD_RELEASE_TAG"),
+        ")"
+    )
 };
 
 #[derive(Parser, Debug)]
