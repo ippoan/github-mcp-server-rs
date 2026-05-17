@@ -11,100 +11,47 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # sccache: GHA backend で rustc コンパイル成果物を cache。
-  # release.yml (rust-binary-release reusable) と同じ shared-key で
-  # ~/.cargo/registry も共有する。
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+  # NOTE: ci-workflows#12 が main に merge されたら参照を `@main` に戻すこと。
+  ci:
+    uses: ippoan/ci-workflows/.github/workflows/rust-ci.yml@claude/check-issue-pyIQb
+    with:
+      binary_name: github-mcp-server-rs
+      shared_key: github-mcp-server-rs
+      build_secret_env_name: MCP_INTERNAL_SECRET
+      # secret 登録済み repo (= ippoan/github-mcp-server-rs main) で
+      # 想定外に dev fallback (21 chars = "dev-secret-do-not-use") に落ちて
+      # いないか早期検知 (#25)。fork PR は secret 不可視で 21 chars になるので
+      # main への push のみで判定 (reusable 側で gating 済)。
+      extra_smoke_test: |
+        OUTPUT="$(./target/release/"$BINARY" doctor)"
+        echo "$OUTPUT"
+        LEN="$(echo "$OUTPUT" | grep -oP 'internal_secret:\s+\(set,\s+\K\d+' || true)"
+        if [ -z "$LEN" ]; then
+          echo "::error::doctor 出力から internal_secret length を抽出できなかった" >&2
+          exit 1
+        fi
+        if [ "$LEN" = "21" ]; then
+          echo "::error::internal_secret が 21 chars = dev fallback。MCP_INTERNAL_SECRET が repo secret に未登録か空の可能性。tag を切る前に確認すること (#25)。" >&2
+          exit 1
+        fi
+        echo "OK: internal_secret embed length=$LEN (not dev fallback)"
+    secrets:
+      BUILD_SECRET: ${{ secrets.MCP_INTERNAL_SECRET }}
 
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: github-mcp-server-rs
-          cache-targets: false
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: sccache --show-stats
-
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: github-mcp-server-rs
-          cache-targets: false
-      - run: cargo test --all-features --no-fail-fast
-      - run: sccache --show-stats
-
-  build:
-    name: cargo build --release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: github-mcp-server-rs
-          cache-targets: false
-      # build.rs が `MCP_INTERNAL_SECRET` env を読んで `cargo:rustc-env` で
-      # binary に embed する (#25)。fork PR では repo secret 不可視で空のまま
-      # build (= dev fallback) になるが、それは failure ではなく仕様。
-      - name: cargo build --release
-        env:
-          MCP_INTERNAL_SECRET: ${{ secrets.MCP_INTERNAL_SECRET }}
-        run: cargo build --release --locked
-      - run: sccache --show-stats
-      - name: Smoke test (CLI --help)
-        run: ./target/release/github-mcp-server-rs --help
-      - name: Smoke test (doctor — embed が dev fallback ではないこと)
-        # secret 登録済み repo (= ippoan/github-mcp-server-rs main) で
-        # 想定外に dev fallback (21 chars = "dev-secret-do-not-use") に落ちて
-        # いないか早期検知 (#25)。fork PR は secret 不可視で 21 chars になるので
-        # main への push のみで判定。
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          OUTPUT="$(./target/release/github-mcp-server-rs doctor)"
-          echo "$OUTPUT"
-          LEN="$(echo "$OUTPUT" | grep -oP 'internal_secret:\s+\(set,\s+\K\d+' || true)"
-          if [ -z "$LEN" ]; then
-            echo "::error::doctor 出力から internal_secret length を抽出できなかった" >&2
-            exit 1
-          fi
-          if [ "$LEN" = "21" ]; then
-            echo "::error::internal_secret が 21 chars = dev fallback。MCP_INTERNAL_SECRET が repo secret に未登録か空の可能性。tag を切る前に確認すること (#25)。" >&2
-            exit 1
-          fi
-          echo "OK: internal_secret embed length=$LEN (not dev fallback)"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: github-mcp-server-rs-linux-x86_64
-          path: target/release/github-mcp-server-rs
-          if-no-files-found: error
-          retention-days: 14
+  auto-merge:
+    name: Auto Merge
+    needs: [ci]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.ci.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
