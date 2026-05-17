@@ -12,3 +12,7 @@ Cargo.lock.bk
 
 # token cache (also lives in ~/.config but in case anyone runs with HOME=$PWD)
 config/
+
+# MCP relay runtime state written by install-mcp.sh (url, mcp-url, relay.pid,
+# relay.log). Per-session, must not be committed.
+.claude/mcp-state/

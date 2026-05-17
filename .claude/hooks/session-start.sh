@@ -42,4 +42,27 @@ cargo fetch --locked
 cargo build --all-targets --locked
 cargo test --all-features --no-run --locked
 
+# Auto-(re)start the MCP relay so a fresh container or a session that woke up
+# after the relay died (e.g. CF WS reset → 3 retry → exit) gets a live MCP URL
+# without manual intervention.
+#
+# install-mcp.sh handles binary install, tag verification (#39, #40), and
+# spawning the WS relay in the background. Re-running is safe: an existing
+# relay process is killed and replaced.
+#
+# Skip when no token cache exists — install-mcp.sh would otherwise block on
+# interactive device-flow auth and time out the SessionStart hook. First-time
+# bootstrap still requires running install-mcp.sh manually so the user can
+# approve the device code in a browser.
+ENV_NAME="${GITHUB_MCP_ENV:-staging}"
+TOKEN_FILE="$HOME/.config/github-mcp-server-rs/token-${ENV_NAME}.json"
+if [ -f "$TOKEN_FILE" ]; then
+  echo "[session-start] starting MCP relay (env=$ENV_NAME)..." >&2
+  bash "$(dirname "$0")/install-mcp.sh" \
+    || echo "[session-start] WARN: install-mcp.sh failed; relay not started" >&2
+else
+  echo "[session-start] MCP relay not auto-started: no cached token at $TOKEN_FILE." >&2
+  echo "[session-start]   Bootstrap once with: bash .claude/hooks/install-mcp.sh" >&2
+fi
+
 echo "[session-start] done." >&2
