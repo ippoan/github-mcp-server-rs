@@ -24,6 +24,7 @@
 # Optional env (with defaults):
 #   GITHUB_MCP_ENV          staging|prod                          (default: staging)
 #   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.6)         (default: latest)
+#   GITHUB_MCP_FORCE_REINSTALL=1  force re-download even when tag matches
 #
 # Override (advanced; 通常は不要):
 #   GITHUB_MCP_INTERNAL_SHARED_SECRET — embed されている値を上書きしたい時のみ
@@ -68,22 +69,48 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$CLAUDE_ENV_FILE"
 fi
 
-# ─── 1. download github-mcp-server-rs release binary ──────────────────────────
+# ─── 1. resolve target release tag & (re)download if stale ───────────────────
+# Issue: previously the script skipped download whenever `$BIN` existed,
+# so consumers stayed pinned to whatever tag was first installed (e.g.
+# v0.0.10 staying live while v0.0.11 was already cut). The relay then
+# advertised a stale tools/list (missing tools added in newer tags).
+#
+# Fix: always resolve the desired TAG, compare against `$BIN.tag` (the tag
+# we recorded at last successful install), and re-download on mismatch.
+# Honors `GITHUB_MCP_FORCE_REINSTALL=1` for ad-hoc forced refresh.
 BIN="$INSTALL_DIR/github-mcp-server-rs"
-if [ ! -x "$BIN" ]; then
-  if [ -n "${GITHUB_MCP_PIN_TAG:-}" ]; then
-    TAG="$GITHUB_MCP_PIN_TAG"
-  else
-    echo "[install-mcp] resolving latest release tag..." >&2
-    TAG="$(curl -sSfL "https://api.github.com/repos/$REPO/releases/latest" \
-            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
-            | head -1 | cut -d'"' -f4)"
-  fi
-  if [ -z "${TAG:-}" ]; then
-    echo "[install-mcp] ERROR: could not resolve a release tag for $REPO" >&2
-    exit 1
-  fi
+TAG_FILE="$BIN.tag"
 
+if [ -n "${GITHUB_MCP_PIN_TAG:-}" ]; then
+  TAG="$GITHUB_MCP_PIN_TAG"
+else
+  echo "[install-mcp] resolving latest release tag..." >&2
+  TAG="$(curl -sSfL "https://api.github.com/repos/$REPO/releases/latest" \
+          | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+          | head -1 | cut -d'"' -f4)"
+fi
+if [ -z "${TAG:-}" ]; then
+  echo "[install-mcp] ERROR: could not resolve a release tag for $REPO" >&2
+  exit 1
+fi
+
+INSTALLED_TAG=""
+[ -s "$TAG_FILE" ] && INSTALLED_TAG="$(cat "$TAG_FILE" 2>/dev/null || true)"
+
+need_install=0
+if [ ! -x "$BIN" ]; then
+  need_install=1
+elif [ "$INSTALLED_TAG" != "$TAG" ]; then
+  echo "[install-mcp] upgrading binary: $INSTALLED_TAG -> $TAG" >&2
+  need_install=1
+elif [ "${GITHUB_MCP_FORCE_REINSTALL:-}" = "1" ]; then
+  echo "[install-mcp] GITHUB_MCP_FORCE_REINSTALL=1 set, re-downloading $TAG" >&2
+  need_install=1
+fi
+
+if [ "$need_install" = "1" ]; then
+  # Note: the existing relay process (if any) is killed in step 4 below
+  # before being restarted, so it picks up the new binary at $BIN.
   ASSET="github-mcp-server-rs-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
   URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
   echo "[install-mcp] downloading $ASSET..." >&2
@@ -106,9 +133,10 @@ if [ ! -x "$BIN" ]; then
     exit 1
   fi
   install -m 0755 "$EXTRACTED" "$BIN"
+  printf '%s\n' "$TAG" > "$TAG_FILE"
   rm -rf "$TMP"
 fi
-echo "[install-mcp] binary: $($BIN --version 2>/dev/null || echo "$BIN")" >&2
+echo "[install-mcp] binary: $($BIN --version 2>/dev/null || echo "$BIN") (tag=$TAG)" >&2
 
 # ─── 2. binary は relay subcommand を持つか? (古い tag の pin 対策) ──────────
 if ! "$BIN" relay --help >/dev/null 2>&1; then
