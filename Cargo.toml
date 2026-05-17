@@ -41,6 +41,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+regex = "1"
 
 [dev-dependencies]
 mockito = "1"

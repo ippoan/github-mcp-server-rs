@@ -1,17 +1,19 @@
 //! MCP server (Streamable HTTP transport) — github_token を使って GitHub API を叩く
 //! tool 群を expose する。
 //!
-//! 起動フロー (main.rs::run_serve から):
-//!   1. token cache から MCP JWT を読む (expired なら refresh)
-//!   2. `/mcp/introspect` を 1 回叩いて github_token + github_login を取得
-//!   3. それらを `GithubMcp` 構造体に格納 → `StreamableHttpService` でラップ
-//!   4. axum で `POST /mcp` を listen
+//! このファイルでは以下を担う:
+//!   - `GithubContext` / `GithubMcp` 構造体 (state + Clone factory)
+//!   - "core" router: `whoami` (ctx 即返し) と `list_repos` (`/user/repos`)
+//!   - `ServerHandler` 実装 (`get_info`)
+//!
+//! ci-dashboard 由来の category 別 tool は `crate::tools::{actions, commits,
+//! issues, logs, pulls, releases, repository}` にあり、`GithubMcp::new` で
+//! `+` operator (`rmcp::ToolRouter: Add`) で全部足し合わせている。
 //!
 //! Token は in-memory cache のみ (1h で expire)。expire 後は再起動必要 (MVP)。
 //! 将来: refresh & introspect を background task で定期更新。
 
-use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, Method};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -20,6 +22,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+use crate::github_api::github_api_json;
 
 /// MCP server で共有する不変 state (起動時に固定)。
 #[derive(Clone)]
@@ -34,11 +38,34 @@ pub struct GithubContext {
 /// で持ち、`Clone` で安く複製できるようにする。
 #[derive(Clone)]
 pub struct GithubMcp {
-    ctx: Arc<GithubContext>,
+    pub(crate) ctx: Arc<GithubContext>,
     /// rmcp の `#[tool_handler]` macro が内部で参照するが、
     /// rust-analyzer の dead code 解析からは見えないので allow を付ける。
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+impl GithubMcp {
+    pub fn new(ctx: Arc<GithubContext>) -> Self {
+        // `core_router` (このファイル) + category routers を ToolRouter::add で合成。
+        // どの module も `#[tool_router(router = X_router, vis = "pub(crate)")]` で
+        // `Self::X_router()` 形式の inherent fn を生やしている。
+        let tool_router = Self::core_router()
+            + Self::actions_router()
+            + Self::commits_router()
+            + Self::issues_router()
+            + Self::logs_router()
+            + Self::projects_router()
+            + Self::pulls_router()
+            + Self::releases_router()
+            + Self::repository_router();
+        Self { ctx, tool_router }
+    }
+
+    /// `crate::tools::*` から `ctx` を読むための共通アクセサ。
+    pub(crate) fn ctx(&self) -> &GithubContext {
+        &self.ctx
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -54,16 +81,7 @@ pub struct ListReposArgs {
     pub page: Option<u32>,
 }
 
-impl GithubMcp {
-    pub fn new(ctx: Arc<GithubContext>) -> Self {
-        Self {
-            ctx,
-            tool_router: Self::tool_router(),
-        }
-    }
-}
-
-#[tool_router]
+#[tool_router(router = core_router, vis = "pub(crate)")]
 impl GithubMcp {
     /// Return the GitHub user associated with the cached MCP JWT.
     /// Useful as a sanity check that the token is valid and which account is being used.
@@ -89,41 +107,23 @@ impl GithubMcp {
         &self,
         Parameters(args): Parameters<ListReposArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let visibility = args.visibility.as_deref().unwrap_or("all");
+        let visibility = args.visibility.unwrap_or_else(|| "all".to_string());
         let per_page = args.per_page.unwrap_or(30).min(100);
         let page = args.page.unwrap_or(1);
-        let url = format!(
-            "https://api.github.com/user/repos?visibility={}&per_page={}&page={}",
-            visibility, per_page, page,
-        );
-        let resp = self
-            .ctx
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.ctx.github_token))
-            .header("User-Agent", "github-mcp-server-rs")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("GitHub request: {e}"), None))?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("GitHub body: {e}"), None))?;
-        if !status.is_success() {
-            return Err(rmcp::ErrorData::internal_error(
-                format!("GitHub /user/repos: HTTP {status} — {text}"),
-                None,
-            ));
-        }
-
-        // GitHub repo の各 entry から代表 field だけ抜き出して返す (token 浪費抑止)。
-        let repos: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("GitHub /user/repos parse: {e}"), None)
-        })?;
+        let repos: serde_json::Value = github_api_json(
+            &self.ctx.client,
+            &self.ctx.github_token,
+            Method::GET,
+            "/user/repos",
+            &[
+                ("visibility", visibility),
+                ("per_page", per_page.to_string()),
+                ("page", page.to_string()),
+            ],
+            None,
+            &[],
+        )
+        .await?;
         let mut summary: Vec<serde_json::Value> = Vec::new();
         if let Some(arr) = repos.as_array() {
             for r in arr {
@@ -151,14 +151,16 @@ impl GithubMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for GithubMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "GitHub MCP server backed by auth-worker (RFC 8628 device flow + introspect). \
-             Tools available: whoami, list_repos. The github_token is auto-recovered \
-             from auth-worker KV via /mcp/introspect at server startup."
+             Tools: whoami, list_repos plus ci-dashboard-derived read tools \
+             (workflow runs / commits / issues / job logs / pull requests / tags / repository). \
+             The github_token is auto-recovered from auth-worker KV via /mcp/introspect at \
+             server startup."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

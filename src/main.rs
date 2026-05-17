@@ -16,10 +16,12 @@
 
 mod auth;
 mod config;
+mod github_api;
 mod introspect;
 mod mcp_server;
 mod relay;
 mod token_cache;
+mod tools;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
