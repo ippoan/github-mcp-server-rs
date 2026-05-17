@@ -16,9 +16,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  # NOTE: ci-workflows#12 が main に merge されたら参照を `@main` に戻すこと。
   ci:
-    uses: ippoan/ci-workflows/.github/workflows/rust-ci.yml@claude/check-issue-pyIQb
+    uses: ippoan/ci-workflows/.github/workflows/rust-ci.yml@main
     with:
       binary_name: github-mcp-server-rs
       shared_key: github-mcp-server-rs
