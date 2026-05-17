@@ -124,12 +124,71 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 度だけ**登録すれば
 セッションをまたいで使える。
 
-### Tools (MVP)
+### Tools
+
+すべての repo 引数は `"owner/name"` または `"name"` (`name` 単独なら `ippoan` を補完)。
+`owner` は allowlist (`ippoan` / `ohishi-exp` / `yhonda-ohishi`) 配下のみ許可、それ以外は
+403 `Org not allowed` で拒否される。
+
+#### Core
 
 | Tool | 引数 | 戻り値 |
 |---|---|---|
 | `whoami` | (なし) | `{ github_login, scope }` |
-| `list_repos` | `visibility?` ("all" / "public" / "private")、`per_page?` (1–100)、`page?` (1+) | `{ page, per_page, count, repos: [{ full_name, private, description, html_url, default_branch, language, stargazers_count, pushed_at }] }` |
+| `list_repos` | `visibility?` ("all" / "public" / "private")、`per_page?` (1–100)、`page?` (1+) | `{ page, per_page, count, repos: [...] }` |
+
+#### Actions (Workflow runs / jobs)
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_workflow_runs` | `repo`, `status?` ("queued"/"in_progress"/"completed"), `per_page?` (1–100, default 10) | `[{ id, name, status, conclusion, branch, actor, created_at, updated_at, url }]` |
+| `get_workflow_run` | `repo`, `run_id` | 上記 + `run_attempt` |
+| `list_workflow_run_jobs` | `repo`, `run_id` | `[{ id, name, status, conclusion, started_at, completed_at, url }]` |
+
+#### Commits
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_commits` | `repo`, `sha?` (branch/tag/sha, default "main"), `path?`, `per_page?` (1–100, default 20) | `[{ sha (short), message (1行目), author, date }]` |
+| `get_commit` | `repo`, `sha` | `{ sha, message, author, date, stats, files: [{ filename, status, additions, deletions, patch (500行で truncate) }] }` |
+
+#### Issues
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_issues` | `repo`, `state?` ("open"/"closed"/"all", default "open"), `labels?` (comma-sep), `per_page?` (1–100, default 20) | `[{ number, title, state, author, labels, created_at, updated_at, comments, url }]` (PR 除外) |
+| `get_issue` | `repo`, `issue_number` | 上記 + `body` + `comments: [{ author, created_at, body }]` |
+| `list_org_issues` | `orgs[]`, `state?`, `labels?[]`, `assignee?` (`@me` 可), `query?` (raw GitHub search), `per_page?` (1–100, default 30) | `{ total_count, incomplete, items: [{ repo, number, title, state, author, labels, assignees, comments, created_at, updated_at, url }] }` |
+
+#### Logs (Workflow job logs)
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `get_job_logs` | `repo`, `job_id`, `tail_lines?` (1–1000, default 200), `start_line?`/`end_line?` (range 指定時 tail_lines 無視) | テキスト (`Lines X-Y of N\n\n1: ...\n2: ...`) |
+| `grep_job_logs` | `repo`, `job_id`, `pattern` (regex, case-insensitive), `context_lines?` (0–20, default 3) | `N matches for /p/i in M lines\n\n> マッチ行 / 周辺` (最大 50 match) |
+
+#### Pull requests
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_pull_requests` | `repo`, `state?` (default "open"), `per_page?` (1–100, default 10) | `[{ number, title, state, author, branch, base, created_at, updated_at, url, draft, mergeable_state }]` |
+| `get_pull_request` | `repo`, `pull_number` | 上記 + `mergeable, additions, deletions, changed_files, checks: [{ name, status, conclusion, url }]` |
+
+#### Releases / Tags
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_tags` | `repo`, `per_page?` (1–100, default 10) | `[{ name, sha (short) }]` |
+| `get_latest_release` | `repo` | `{ tag, name, published_at, author, url, body (500文字 snippet) }` |
+
+#### Repository (file tree / content / code search)
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `get_file_tree` | `repo`, `ref?` (default "main"), `path?` (prefix filter) | `N entries\n\nf src/...\nd dir/...` |
+| `get_file_content` | `repo`, `path`, `ref?`, `start_line?`/`end_line?` | ファイル → 行番号付き本文 / ディレクトリ → entry リスト |
+| `search_code` | `repo`, `query`, `path?`, `extension?`, `per_page?` (1–100, default 20) | `N matches\n\n## path\n<text-match fragment>` |
+| `search_symbols` | `repo`, `symbol`, `kind?` ("function"/"class"/"struct"/"interface"/"type"/"enum"/"trait"/"mod"), `language?`, `per_page?` (1–50, default 10) | `search_code` と同形式 |
 
 ### `--state-dir` (install hook 連携用)
 
@@ -247,12 +306,30 @@ src/
 ├── auth.rs         — RFC 8628 device flow (start + poll + refresh)
 ├── introspect.rs   — POST /mcp/introspect → github_token 復元
 ├── token_cache.rs  — ~/.config/.../token-{env}.json への永続化 (0600 perm)
-├── mcp_server.rs   — rmcp ServerHandler 実装 + tool_router (whoami / list_repos)
+├── github_api.rs   — GitHub REST/Search 共通ヘルパー (parse_repo / validate_org / github_api_json / github_api_raw)
+├── mcp_server.rs   — rmcp ServerHandler 実装 + core tool_router (whoami / list_repos) + 各 category router 合成
+├── tools/          — ci-dashboard 由来の category 別ツール群 (issue #35)
+│   ├── actions.rs    — workflow runs / jobs
+│   ├── commits.rs    — commit list / detail
+│   ├── issues.rs     — list / get / list_org_issues (search-backed, PR 除外)
+│   ├── logs.rs       — get_job_logs (tail/range) / grep_job_logs (regex + context)
+│   ├── pulls.rs      — list / get (check-runs 込み)
+│   ├── releases.rs   — list_tags / get_latest_release
+│   └── repository.rs — get_file_tree / get_file_content / search_code / search_symbols
 └── relay/
     ├── mod.rs      — outbound WS client + reconnect + JWT refresh (issue #27)
     ├── frame.rs    — WS frame schema (Req / Resp / Hello, JSON over Text frame)
     └── bridge.rs   — Frame ↔ axum::Request/Response ↔ tower::Service dispatch
 ```
+
+各 tool module は `#[tool_router(router = X_router, vis = "pub(crate)")] impl GithubMcp { ... }`
+で `Self::X_router()` 形式の inherent fn を生やし、`mcp_server.rs::GithubMcp::new` で
+`+` operator (`rmcp::ToolRouter: Add`) で合成される。新 category を増やす場合:
+
+1. `src/tools/<name>.rs` を作って `#[tool_router(router = <name>_router, vis = "pub(crate)")]` を貼る
+2. `src/tools/mod.rs` に `pub mod <name>;` を追加
+3. `src/mcp_server.rs::GithubMcp::new` の `+` chain に `Self::<name>_router()` を足す
+4. `tests/relay_smoke.rs` の `#[path]` mod は触らなくて OK (`tools::*` は parent mod 経由で見える)
 
 ## Claude Code on the web から使う (別 repo から install hook 経由)
 

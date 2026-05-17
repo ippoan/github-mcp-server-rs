@@ -43,6 +43,8 @@ use tower::Service;
 mod auth;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/github_api.rs"]
+mod github_api;
 #[path = "../src/introspect.rs"]
 mod introspect;
 #[path = "../src/mcp_server.rs"]
@@ -51,6 +53,8 @@ mod mcp_server;
 mod relay;
 #[path = "../src/token_cache.rs"]
 mod token_cache;
+#[path = "../src/tools/mod.rs"]
+mod tools;
 // -----------------------------------------------------------
 
 use crate::config::{AuthEnv, Config};
