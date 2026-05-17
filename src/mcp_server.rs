@@ -55,6 +55,7 @@ impl GithubMcp {
             + Self::commits_router()
             + Self::issues_router()
             + Self::logs_router()
+            + Self::projects_router()
             + Self::pulls_router()
             + Self::releases_router()
             + Self::repository_router();

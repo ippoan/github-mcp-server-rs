@@ -193,6 +193,24 @@ URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 �
 | `get_latest_release` | `repo` | `{ tag, name, published_at, author, url, body (500文字 snippet) }` |
 | `create_tag_release` (write) | `repo` (`tag-release.yml` 必須) | `tag-release dispatched for owner/name` |
 
+#### Projects v2 (GraphQL)
+
+GitHub Projects v2 は REST surface が無く、すべて GraphQL。`repositoryOwner(login:)`
++ `Organization` / `User` inline fragment で user account login (`yhonda-ohishi` 等) も
+動くようにしてある。書込み系は内部で `project number → projectId` / `issue number → contentId` /
+`field name → fieldId` を resolve するので、ユーザは node ID を直接扱わなくて良い。
+
+| Tool | 引数 | 戻り値 |
+|---|---|---|
+| `list_org_projects` | `orgs[]` (allowlist), `first?` (1–100, default 50), `include_closed?` (default false) | `[{ org, projects: [{ number, title, url, closed, shortDescription }] }]` |
+| `get_project` | `org`, `number` | `{ id, number, title, url, closed, shortDescription, fields: [{ id, name, dataType, options?, iterations? }] }` |
+| `list_project_items` | `org`, `number`, `first?` (1–100, default 50) | `[{ item_id, item_type, content: { type, repo, number, title, state, url }, fields: { 名前: 値 } }]` |
+| `add_issue_to_project` (write) | `org`, `project_number`, `repo`, `issue_number` | `{ item_id, project_id, content_id, repo, issue_number }` |
+| `remove_project_item` (write) | `org`, `project_number`, `item_id` | `{ deleted_item_id }` |
+| `set_project_item_field` (write) | `org`, `project_number`, `item_id`, `field_name`, `value` (string/number/null) | `{ item_id, field, dataType, value }`、null clear 時は `{ ..., cleared: true }` |
+| `create_project_field` (write) | `org`, `project_number`, `name`, `data_type` ("text"/"number"/"date"/"single_select"), `single_select_options?[]` | `{ field: { __typename, id, name, dataType, options? } }` |
+| `create_project` (write) | `org`, `title`, `short_description?` (2 段階 mutation、後段失敗で `warning` 同梱) | `{ id, number, title, url, shortDescription, warning? }` |
+
 #### Repository (file tree / content / code search)
 
 | Tool | 引数 | 戻り値 |
@@ -318,13 +336,14 @@ src/
 ├── auth.rs         — RFC 8628 device flow (start + poll + refresh)
 ├── introspect.rs   — POST /mcp/introspect → github_token 復元
 ├── token_cache.rs  — ~/.config/.../token-{env}.json への永続化 (0600 perm)
-├── github_api.rs   — GitHub REST/Search 共通ヘルパー (parse_repo / validate_org / github_api_json / github_api_raw)
+├── github_api.rs   — GitHub REST/Search/GraphQL 共通ヘルパー (parse_repo / validate_org / github_api_json / github_api_raw / github_graphql)
 ├── mcp_server.rs   — rmcp ServerHandler 実装 + core tool_router (whoami / list_repos) + 各 category router 合成
 ├── tools/          — ci-dashboard 由来の category 別ツール群 (issue #35)
 │   ├── actions.rs    — workflow runs / jobs (list/get + rerun/rerun_failed_jobs/cancel)
 │   ├── commits.rs    — commit list / detail
 │   ├── issues.rs     — list / get / list_org_issues (search-backed, PR 除外) / create / update / comment / labels / close / reopen
 │   ├── logs.rs       — get_job_logs (tail/range) / grep_job_logs (regex + context)
+│   ├── projects.rs   — Projects v2 (GraphQL): list_org_projects / get_project / list_project_items / add_issue_to_project / remove_project_item / set_project_item_field / create_project_field / create_project
 │   ├── pulls.rs      — list / get (check-runs 込み) / merge_pull_request
 │   ├── releases.rs   — list_tags / get_latest_release / create_tag_release
 │   └── repository.rs — get_file_tree / get_file_content / search_code / search_symbols

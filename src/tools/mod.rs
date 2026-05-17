@@ -8,6 +8,7 @@ pub mod actions;
 pub mod commits;
 pub mod issues;
 pub mod logs;
+pub mod projects;
 pub mod pulls;
 pub mod releases;
 pub mod repository;

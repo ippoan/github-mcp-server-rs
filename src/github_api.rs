@@ -118,6 +118,57 @@ pub async fn github_api_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
+/// GitHub GraphQL API caller. Projects v2 が REST に surface を持たないため必須。
+/// レスポンス JSON の `errors[]` を含んだら、メッセージを `;` 区切りに concat して
+/// `GitHubApiError::Http { status: 400, ... }` として丸める (ci-dashboard 同等)。
+pub async fn github_graphql<T: DeserializeOwned>(
+    client: &Client,
+    token: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<T, GitHubApiError> {
+    let body = serde_json::json!({
+        "query": query,
+        "variables": variables,
+    });
+    let resp = apply_common_headers(
+        client.post(format!("{GITHUB_API}/graphql")),
+        token,
+    )
+    .header("Content-Type", "application/json")
+    .json(&body)
+    .send()
+    .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        return Err(GitHubApiError::Http {
+            status: status.as_u16(),
+            body: text,
+        });
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    if let Some(errs) = parsed.get("errors").and_then(|v| v.as_array()) {
+        if !errs.is_empty() {
+            let msgs: Vec<&str> = errs
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect();
+            return Err(GitHubApiError::Http {
+                status: 400,
+                body: format!("GitHub GraphQL error: {}", msgs.join("; ")),
+            });
+        }
+    }
+    let Some(data) = parsed.get("data") else {
+        return Err(GitHubApiError::Http {
+            status: 500,
+            body: "GitHub GraphQL: empty data".to_string(),
+        });
+    };
+    Ok(serde_json::from_value(data.clone())?)
+}
+
 /// Job log のように plain text を返す endpoint 用 (redirect は reqwest が自動追従)。
 pub async fn github_api_raw(
     client: &Client,
