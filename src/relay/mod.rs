@@ -580,7 +580,10 @@ mod tests {
     #[test]
     fn loop_state_first_clean_close_reconnects_with_cooldown() {
         let mut s = LoopState::default();
-        assert_eq!(s.on_clean_close(), LoopAction::Reconnect(RECONNECT_COOLDOWN));
+        assert_eq!(
+            s.on_clean_close(),
+            LoopAction::Reconnect(RECONNECT_COOLDOWN)
+        );
         assert_eq!(s.clean_close_streak, 1);
     }
 
@@ -636,6 +639,9 @@ mod tests {
         let _ = s.on_network_error();
         assert_eq!(s.clean_close_streak, 0);
         // Next clean close は streak=1 から、即 ExitOk にはならない
-        assert_eq!(s.on_clean_close(), LoopAction::Reconnect(RECONNECT_COOLDOWN));
+        assert_eq!(
+            s.on_clean_close(),
+            LoopAction::Reconnect(RECONNECT_COOLDOWN)
+        );
     }
 }
