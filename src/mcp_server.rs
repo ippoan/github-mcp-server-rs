@@ -167,3 +167,36 @@ impl ServerHandler for GithubMcp {
         info
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_mcp() -> GithubMcp {
+        let ctx = Arc::new(GithubContext {
+            github_token: "x".to_string(),
+            github_login: "x".to_string(),
+            scope: "x".to_string(),
+            client: Client::new(),
+        });
+        GithubMcp::new(ctx)
+    }
+
+    #[test]
+    fn dump_registered_tool_names() {
+        let mcp = build_mcp();
+        let mut names: Vec<String> = mcp
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        eprintln!("TOOL_DUMP count={} names={:?}", names.len(), names);
+        assert!(names.contains(&"whoami".to_string()), "whoami missing");
+        assert!(
+            names.contains(&"list_repos".to_string()),
+            "list_repos missing"
+        );
+    }
+}
