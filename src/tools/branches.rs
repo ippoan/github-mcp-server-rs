@@ -31,8 +31,10 @@ pub struct SetBranchProtectionArgs {
     /// Require branches to be up to date before merging. Default: true.
     #[serde(default = "default_true")]
     pub strict_required_checks: bool,
-    /// Also enforce protection for admins. Default: false (admins can bypass).
-    #[serde(default)]
+    /// Also enforce protection for admins. Default: true (admins are NOT
+    /// allowed to bypass — solo-dev repos rely on this to keep the gate
+    /// real). Pass `false` explicitly to let admins bypass.
+    #[serde(default = "default_true")]
     pub enforce_admins: bool,
     /// Block merge until all review threads are resolved. Default: true.
     #[serde(default = "default_true")]
