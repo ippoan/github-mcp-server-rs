@@ -97,11 +97,32 @@ fi
 INSTALLED_TAG=""
 [ -s "$TAG_FILE" ] && INSTALLED_TAG="$(cat "$TAG_FILE" 2>/dev/null || true)"
 
+# Read the release tag the binary was built from. Release builds embed it
+# via build.rs (`BUILD_RELEASE_TAG` from `GITHUB_REF_NAME` on tag push),
+# and clap prints it in parentheses, e.g.:
+#   github-mcp-server-rs 0.1.0 (v0.0.11)
+# Dev/local builds emit no parens, so $EMBEDDED_TAG stays empty.
+EMBEDDED_TAG=""
+if [ -x "$BIN" ]; then
+  EMBEDDED_TAG="$("$BIN" --version 2>/dev/null \
+    | grep -oE '\(v[0-9][^)]*\)' \
+    | head -1 \
+    | tr -d '()' || true)"
+fi
+
 need_install=0
 if [ ! -x "$BIN" ]; then
   need_install=1
 elif [ "$INSTALLED_TAG" != "$TAG" ]; then
   echo "[install-mcp] upgrading binary: $INSTALLED_TAG -> $TAG" >&2
+  need_install=1
+elif [ -n "$EMBEDDED_TAG" ] && [ "$EMBEDDED_TAG" != "$TAG" ]; then
+  # Extra guard added on top of #39's TAG_FILE check: the file can lie
+  # (manual touch, partial install, copy from another host), so cross-check
+  # against the tag the binary itself was built from. Empty EMBEDDED_TAG
+  # means a pre-guard release or a local dev build — skip the check in
+  # that case to avoid clobbering legitimate dev binaries.
+  echo "[install-mcp] binary embeds $EMBEDDED_TAG but expected $TAG -- re-downloading" >&2
   need_install=1
 elif [ "${GITHUB_MCP_FORCE_REINSTALL:-}" = "1" ]; then
   echo "[install-mcp] GITHUB_MCP_FORCE_REINSTALL=1 set, re-downloading $TAG" >&2
