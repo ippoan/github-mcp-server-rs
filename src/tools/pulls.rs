@@ -1,4 +1,4 @@
-//! Pull requests 読取り — ci-dashboard `src/mcp/tools/pulls.ts` 移植。
+//! Pull requests (ci-dashboard `src/mcp/tools/pulls.ts` 移植) — read + write 両方。
 
 use reqwest::Method;
 use rmcp::{
@@ -152,4 +152,50 @@ impl GithubMcp {
             serde_json::to_string_pretty(&result).unwrap_or_default(),
         )]))
     }
+
+    /// Merge a pull request using squash merge.
+    #[tool(description = "Merge a pull request using squash merge.")]
+    async fn merge_pull_request(
+        &self,
+        Parameters(args): Parameters<MergePullArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "merge_method".into(),
+            serde_json::Value::String("squash".into()),
+        );
+        if let Some(t) = args.commit_title {
+            payload.insert("commit_title".into(), serde_json::Value::String(t));
+        }
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/merge",
+            r.owner, r.repo, args.pull_number
+        );
+        let _: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::PUT,
+            &path,
+            &[],
+            Some(&serde_json::Value::Object(payload)),
+            &[],
+        )
+        .await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "PR #{} merged (squash)",
+            args.pull_number
+        ))]))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MergePullArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// PR number.
+    pub pull_number: u64,
+    /// Custom commit title (optional).
+    #[serde(default)]
+    pub commit_title: Option<String>,
 }

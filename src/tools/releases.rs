@@ -1,4 +1,4 @@
-//! Tags / releases 読取り — ci-dashboard `src/mcp/tools/releases.ts` 移植 (read のみ)。
+//! Tags / releases (ci-dashboard `src/mcp/tools/releases.ts` 移植) — read + write 両方。
 
 use reqwest::Method;
 use rmcp::{
@@ -99,4 +99,39 @@ impl GithubMcp {
             serde_json::to_string_pretty(&result).unwrap_or_default(),
         )]))
     }
+
+    /// Dispatch tag-release.yml workflow to create a patch release.
+    /// repo は `tag-release.yml` を持っている前提 (ci-dashboard 規約)。
+    #[tool(description = "Dispatch tag-release.yml workflow to create a patch release.")]
+    async fn create_tag_release(
+        &self,
+        Parameters(args): Parameters<CreateTagReleaseArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/actions/workflows/tag-release.yml/dispatches",
+            r.owner, r.repo
+        );
+        let payload = serde_json::json!({ "ref": "main" });
+        let _: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            Some(&payload),
+            &[],
+        )
+        .await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "tag-release dispatched for {}/{}",
+            r.owner, r.repo
+        ))]))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTagReleaseArgs {
+    /// Repository as 'org/name' (e.g. 'ippoan/rust-alc-api').
+    pub repo: String,
 }

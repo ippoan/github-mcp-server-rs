@@ -1,4 +1,4 @@
-//! Workflow runs / jobs の読取り系ツール (ci-dashboard `src/mcp/tools/actions.ts` 移植)。
+//! Workflow runs / jobs (ci-dashboard `src/mcp/tools/actions.ts` 移植)。read + write 両方。
 
 use reqwest::Method;
 use rmcp::{
@@ -108,6 +108,87 @@ impl GithubMcp {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&summary).unwrap_or_default(),
         )]))
+    }
+
+    /// Re-run all jobs in a workflow run.
+    #[tool(description = "Re-run all jobs in a workflow run.")]
+    async fn rerun_workflow_run(
+        &self,
+        Parameters(args): Parameters<WorkflowRunIdArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/actions/runs/{}/rerun",
+            r.owner, r.repo, args.run_id
+        );
+        let _: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            None,
+            &[],
+        )
+        .await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Rerun triggered for run {}",
+            args.run_id
+        ))]))
+    }
+
+    /// Re-run only failed jobs in a workflow run.
+    #[tool(description = "Re-run only failed jobs in a workflow run.")]
+    async fn rerun_failed_jobs(
+        &self,
+        Parameters(args): Parameters<WorkflowRunIdArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/actions/runs/{}/rerun-failed-jobs",
+            r.owner, r.repo, args.run_id
+        );
+        let _: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            None,
+            &[],
+        )
+        .await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Rerun of failed jobs triggered for run {}",
+            args.run_id
+        ))]))
+    }
+
+    /// Cancel an in-progress workflow run.
+    #[tool(description = "Cancel an in-progress workflow run.")]
+    async fn cancel_workflow_run(
+        &self,
+        Parameters(args): Parameters<WorkflowRunIdArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/actions/runs/{}/cancel",
+            r.owner, r.repo, args.run_id
+        );
+        let _: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            None,
+            &[],
+        )
+        .await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Cancelled run {}",
+            args.run_id
+        ))]))
     }
 
     /// List jobs for a workflow run.

@@ -144,6 +144,9 @@ URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 �
 | `list_workflow_runs` | `repo`, `status?` ("queued"/"in_progress"/"completed"), `per_page?` (1–100, default 10) | `[{ id, name, status, conclusion, branch, actor, created_at, updated_at, url }]` |
 | `get_workflow_run` | `repo`, `run_id` | 上記 + `run_attempt` |
 | `list_workflow_run_jobs` | `repo`, `run_id` | `[{ id, name, status, conclusion, started_at, completed_at, url }]` |
+| `rerun_workflow_run` (write) | `repo`, `run_id` | `Rerun triggered for run N` |
+| `rerun_failed_jobs` (write) | `repo`, `run_id` | `Rerun of failed jobs triggered for run N` |
+| `cancel_workflow_run` (write) | `repo`, `run_id` | `Cancelled run N` |
 
 #### Commits
 
@@ -159,6 +162,13 @@ URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 �
 | `list_issues` | `repo`, `state?` ("open"/"closed"/"all", default "open"), `labels?` (comma-sep), `per_page?` (1–100, default 20) | `[{ number, title, state, author, labels, created_at, updated_at, comments, url }]` (PR 除外) |
 | `get_issue` | `repo`, `issue_number` | 上記 + `body` + `comments: [{ author, created_at, body }]` |
 | `list_org_issues` | `orgs[]`, `state?`, `labels?[]`, `assignee?` (`@me` 可), `query?` (raw GitHub search), `per_page?` (1–100, default 30) | `{ total_count, incomplete, items: [{ repo, number, title, state, author, labels, assignees, comments, created_at, updated_at, url }] }` |
+| `create_issue` (write) | `repo`, `title`, `body?`, `labels?[]`, `assignees?[]` | `{ number, title, state, url }` |
+| `update_issue` (write) | `repo`, `issue_number`, `title?`/`body?`/`labels?[]`/`assignees?[]`/`milestone?` (number\|null) — 最低 1 つ必須 | `{ number, title, state, labels, url }` |
+| `add_issue_comment` (write) | `repo`, `issue_number`, `body` | `{ id, url, created_at }` |
+| `add_labels` (write) | `repo`, `issue_number`, `labels[]` (非空) | `[label_name]` (最新のラベル一覧) |
+| `remove_label` (write) | `repo`, `issue_number`, `label` (UTF-8 path-encode 対応) | `[label_name]` (残りのラベル一覧) |
+| `close_issue` (write) | `repo`, `issue_number`, `state_reason?` ("completed"/"not_planned"、default "completed") | `{ number, state, state_reason, url }` |
+| `reopen_issue` (write) | `repo`, `issue_number` | `{ number, state, url }` |
 
 #### Logs (Workflow job logs)
 
@@ -173,6 +183,7 @@ URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 �
 |---|---|---|
 | `list_pull_requests` | `repo`, `state?` (default "open"), `per_page?` (1–100, default 10) | `[{ number, title, state, author, branch, base, created_at, updated_at, url, draft, mergeable_state }]` |
 | `get_pull_request` | `repo`, `pull_number` | 上記 + `mergeable, additions, deletions, changed_files, checks: [{ name, status, conclusion, url }]` |
+| `merge_pull_request` (write) | `repo`, `pull_number`, `commit_title?` | `PR #N merged (squash)` |
 
 #### Releases / Tags
 
@@ -180,6 +191,7 @@ URL は **github_login で固定**。Claude Code Web の MCP 設定には **1 �
 |---|---|---|
 | `list_tags` | `repo`, `per_page?` (1–100, default 10) | `[{ name, sha (short) }]` |
 | `get_latest_release` | `repo` | `{ tag, name, published_at, author, url, body (500文字 snippet) }` |
+| `create_tag_release` (write) | `repo` (`tag-release.yml` 必須) | `tag-release dispatched for owner/name` |
 
 #### Repository (file tree / content / code search)
 
@@ -309,12 +321,12 @@ src/
 ├── github_api.rs   — GitHub REST/Search 共通ヘルパー (parse_repo / validate_org / github_api_json / github_api_raw)
 ├── mcp_server.rs   — rmcp ServerHandler 実装 + core tool_router (whoami / list_repos) + 各 category router 合成
 ├── tools/          — ci-dashboard 由来の category 別ツール群 (issue #35)
-│   ├── actions.rs    — workflow runs / jobs
+│   ├── actions.rs    — workflow runs / jobs (list/get + rerun/rerun_failed_jobs/cancel)
 │   ├── commits.rs    — commit list / detail
-│   ├── issues.rs     — list / get / list_org_issues (search-backed, PR 除外)
+│   ├── issues.rs     — list / get / list_org_issues (search-backed, PR 除外) / create / update / comment / labels / close / reopen
 │   ├── logs.rs       — get_job_logs (tail/range) / grep_job_logs (regex + context)
-│   ├── pulls.rs      — list / get (check-runs 込み)
-│   ├── releases.rs   — list_tags / get_latest_release
+│   ├── pulls.rs      — list / get (check-runs 込み) / merge_pull_request
+│   ├── releases.rs   — list_tags / get_latest_release / create_tag_release
 │   └── repository.rs — get_file_tree / get_file_content / search_code / search_symbols
 └── relay/
     ├── mod.rs      — outbound WS client + reconnect + JWT refresh (issue #27)

@@ -1,4 +1,4 @@
-//! Issues 読取り (list / get / list_org_issues) — ci-dashboard `src/mcp/tools/issues.ts` 移植。
+//! Issues (ci-dashboard `src/mcp/tools/issues.ts` 移植) — read + write 両方。
 
 use reqwest::Method;
 use rmcp::{
@@ -320,5 +320,427 @@ impl GithubMcp {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
         )]))
+    }
+
+    /// Create a new issue in a repository.
+    #[tool(description = "Create a new issue in a repository.")]
+    async fn create_issue(
+        &self,
+        Parameters(args): Parameters<CreateIssueArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let mut payload = serde_json::Map::new();
+        payload.insert("title".into(), serde_json::Value::String(args.title));
+        if let Some(b) = args.body {
+            payload.insert("body".into(), serde_json::Value::String(b));
+        }
+        if let Some(labels) = args.labels {
+            payload.insert("labels".into(), serde_json::json!(labels));
+        }
+        if let Some(assignees) = args.assignees {
+            payload.insert("assignees".into(), serde_json::json!(assignees));
+        }
+        let path = format!("/repos/{}/{}/issues", r.owner, r.repo);
+        let created: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            Some(&serde_json::Value::Object(payload)),
+            &[],
+        )
+        .await?;
+        let result = serde_json::json!({
+            "number": created.get("number"),
+            "title": created.get("title"),
+            "state": created.get("state"),
+            "url": created.get("html_url"),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    /// Update an existing issue's title / body / labels / assignees / milestone.
+    /// State changes are intentionally not supported — use `close_issue` / `reopen_issue`.
+    #[tool(
+        description = "Update an existing issue's title / body / labels / assignees / milestone. State changes are intentionally not supported here — use close_issue / reopen_issue."
+    )]
+    async fn update_issue(
+        &self,
+        Parameters(args): Parameters<UpdateIssueArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let mut payload = serde_json::Map::new();
+        if let Some(t) = args.title {
+            payload.insert("title".into(), serde_json::Value::String(t));
+        }
+        if let Some(b) = args.body {
+            payload.insert("body".into(), serde_json::Value::String(b));
+        }
+        if let Some(labels) = args.labels {
+            payload.insert("labels".into(), serde_json::json!(labels));
+        }
+        if let Some(assignees) = args.assignees {
+            payload.insert("assignees".into(), serde_json::json!(assignees));
+        }
+        // `milestone: null` を明示するため Option<Option<u64>> ではなく
+        // serde_json::Value で `Null` を受け取れる UpdateIssueArgs::milestone を
+        // 使う (null も値 detach として有効)。
+        if let Some(m) = args.milestone {
+            payload.insert("milestone".into(), m);
+        }
+        if payload.is_empty() {
+            return Err(rmcp::ErrorData::invalid_params(
+                "update_issue: at least one of title/body/labels/assignees/milestone must be provided",
+                None,
+            ));
+        }
+        let path = format!(
+            "/repos/{}/{}/issues/{}",
+            r.owner, r.repo, args.issue_number
+        );
+        let updated: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::PATCH,
+            &path,
+            &[],
+            Some(&serde_json::Value::Object(payload)),
+            &[],
+        )
+        .await?;
+        let labels: Vec<&str> = updated
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let result = serde_json::json!({
+            "number": updated.get("number"),
+            "title": updated.get("title"),
+            "state": updated.get("state"),
+            "labels": labels,
+            "url": updated.get("html_url"),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    /// Add a comment to an existing issue or pull request.
+    #[tool(description = "Add a comment to an existing issue or pull request.")]
+    async fn add_issue_comment(
+        &self,
+        Parameters(args): Parameters<AddIssueCommentArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/issues/{}/comments",
+            r.owner, r.repo, args.issue_number
+        );
+        let body = serde_json::json!({ "body": args.body });
+        let created: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            Some(&body),
+            &[],
+        )
+        .await?;
+        let result = serde_json::json!({
+            "id": created.get("id"),
+            "url": created.get("html_url"),
+            "created_at": created.get("created_at"),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    /// Add labels to an issue or pull request. Returns the current label list.
+    #[tool(
+        description = "Add labels to an issue or pull request. Returns the current label list."
+    )]
+    async fn add_labels(
+        &self,
+        Parameters(args): Parameters<AddLabelsArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if args.labels.is_empty() {
+            return Err(rmcp::ErrorData::invalid_params(
+                "labels must be a non-empty array",
+                None,
+            ));
+        }
+        let r = parse_and_validate_repo(&args.repo)?;
+        let path = format!(
+            "/repos/{}/{}/issues/{}/labels",
+            r.owner, r.repo, args.issue_number
+        );
+        let payload = serde_json::json!({ "labels": args.labels });
+        let updated: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::POST,
+            &path,
+            &[],
+            Some(&payload),
+            &[],
+        )
+        .await?;
+        let names: Vec<&str> = updated
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&names).unwrap_or_default(),
+        )]))
+    }
+
+    /// Remove a single label from an issue or pull request. Returns the remaining label list.
+    #[tool(
+        description = "Remove a single label from an issue or pull request. Returns the remaining label list."
+    )]
+    async fn remove_label(
+        &self,
+        Parameters(args): Parameters<RemoveLabelArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        // `encodeURIComponent` 相当: utf8_percent_encode を使わず GitHub API が
+        // 受け付ける範囲だけ手動で escape。RFC 3986 unreserved + sub-delims のうち
+        // path segment で問題になる `/`, `?`, `#`, ` ` のみ最低限置換。
+        let label = url_path_encode(&args.label);
+        let path = format!(
+            "/repos/{}/{}/issues/{}/labels/{}",
+            r.owner, r.repo, args.issue_number, label
+        );
+        let remaining: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::DELETE,
+            &path,
+            &[],
+            None,
+            &[],
+        )
+        .await?;
+        let names: Vec<&str> = remaining
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&names).unwrap_or_default(),
+        )]))
+    }
+
+    /// Close an issue. Optionally set state_reason to "completed" or "not_planned".
+    #[tool(
+        description = "Close an issue. Optionally set state_reason to 'completed' or 'not_planned'."
+    )]
+    async fn close_issue(
+        &self,
+        Parameters(args): Parameters<CloseIssueArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let state_reason = args
+            .state_reason
+            .unwrap_or_else(|| "completed".to_string());
+        let payload = serde_json::json!({
+            "state": "closed",
+            "state_reason": state_reason,
+        });
+        let path = format!(
+            "/repos/{}/{}/issues/{}",
+            r.owner, r.repo, args.issue_number
+        );
+        let updated: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::PATCH,
+            &path,
+            &[],
+            Some(&payload),
+            &[],
+        )
+        .await?;
+        let result = serde_json::json!({
+            "number": updated.get("number"),
+            "state": updated.get("state"),
+            "state_reason": updated.get("state_reason"),
+            "url": updated.get("html_url"),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    /// Reopen a closed issue.
+    #[tool(description = "Reopen a closed issue.")]
+    async fn reopen_issue(
+        &self,
+        Parameters(args): Parameters<GetIssueArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let r = parse_and_validate_repo(&args.repo)?;
+        let payload = serde_json::json!({ "state": "open" });
+        let path = format!(
+            "/repos/{}/{}/issues/{}",
+            r.owner, r.repo, args.issue_number
+        );
+        let updated: serde_json::Value = github_api_json(
+            &self.ctx().client,
+            &self.ctx().github_token,
+            Method::PATCH,
+            &path,
+            &[],
+            Some(&payload),
+            &[],
+        )
+        .await?;
+        let result = serde_json::json!({
+            "number": updated.get("number"),
+            "state": updated.get("state"),
+            "url": updated.get("html_url"),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateIssueArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue title.
+    pub title: String,
+    /// Issue body (markdown).
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Label names to attach.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    /// GitHub usernames to assign.
+    #[serde(default)]
+    pub assignees: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateIssueArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue number.
+    pub issue_number: u64,
+    /// New title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New body (markdown). Pass "" to clear.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Replace labels with this list (pass [] to remove all).
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    /// Replace assignees with this list (pass [] to clear).
+    #[serde(default)]
+    pub assignees: Option<Vec<String>>,
+    /// Milestone number, or null to detach.
+    /// `serde_json::Value` で受け取って `null` 明示と未指定を区別する。
+    #[serde(default)]
+    pub milestone: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddIssueCommentArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue or PR number.
+    pub issue_number: u64,
+    /// Comment body (markdown).
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddLabelsArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue or PR number.
+    pub issue_number: u64,
+    /// Label names to add (non-empty).
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RemoveLabelArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue or PR number.
+    pub issue_number: u64,
+    /// Label name to remove.
+    pub label: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CloseIssueArgs {
+    /// Repository (e.g. 'rust-alc-api').
+    pub repo: String,
+    /// Issue number.
+    pub issue_number: u64,
+    /// Reason for closing: "completed" | "not_planned" (default: "completed").
+    #[serde(default)]
+    pub state_reason: Option<String>,
+}
+
+/// URL path segment encoding for label names. GitHub `DELETE /labels/{name}` は
+/// reserved char (space / `/` / `?` / `#`) を含むラベル名で 404 になるので、
+/// 該当 char を percent-encode する。`%` 自体も escape する。
+fn url_path_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            // unreserved: A-Z a-z 0-9 - . _ ~ + その他 ASCII printable は素通し
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_path_encode;
+
+    #[test]
+    fn url_path_encode_passthrough_alphanum() {
+        assert_eq!(url_path_encode("bug"), "bug");
+        assert_eq!(url_path_encode("good-first-issue"), "good-first-issue");
+    }
+
+    #[test]
+    fn url_path_encode_escapes_space_and_slash() {
+        assert_eq!(url_path_encode("type: bug"), "type%3A%20bug");
+        assert_eq!(url_path_encode("priority/high"), "priority%2Fhigh");
+    }
+
+    #[test]
+    fn url_path_encode_escapes_utf8() {
+        // 日本語ラベル (ci-dashboard で使用例あり)
+        let out = url_path_encode("バグ");
+        // バ = E3 83 90, グ = E3 82 B0
+        assert_eq!(out, "%E3%83%90%E3%82%B0");
     }
 }
