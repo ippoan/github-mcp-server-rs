@@ -40,9 +40,23 @@ use crate::config::{AuthEnv, Config};
 use crate::relay::RelayContext;
 use crate::token_cache::TokenSet;
 
+/// `--version` 出力に焼き込む文字列。
+///
+/// `CARGO_PKG_VERSION` (Cargo.toml の "0.1.0") は release ごとに bump されないので、
+/// install-mcp.sh から「いま走っている binary が target release tag のものか」を
+/// 識別できない (#39 の TAG_FILE が嘘の時に検出できない)。release.yml が tag push で
+/// 走るとき `GITHUB_REF_NAME=v0.0.NN` が set されるので、build.rs がそれを
+/// `BUILD_RELEASE_TAG` env で焼き込み、ここで `--version` 出力に append する。
+/// dev build では空文字なので format は `0.1.0` のまま。
+const VERSION: &str = if env!("BUILD_RELEASE_TAG").is_empty() {
+    env!("CARGO_PKG_VERSION")
+} else {
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("BUILD_RELEASE_TAG"), ")")
+};
+
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    version = VERSION,
     about = "GitHub MCP server with auth-worker Device Flow client"
 )]
 struct Cli {
