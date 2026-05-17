@@ -52,6 +52,7 @@ impl GithubMcp {
         // `Self::X_router()` 形式の inherent fn を生やしている。
         let tool_router = Self::core_router()
             + Self::actions_router()
+            + Self::branches_router()
             + Self::commits_router()
             + Self::issues_router()
             + Self::logs_router()
