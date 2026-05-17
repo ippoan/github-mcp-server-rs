@@ -106,7 +106,10 @@ impl GithubMcp {
                 &self.ctx().client,
                 &self.ctx().github_token,
                 Method::GET,
-                &format!("/repos/{}/{}/commits/{}/check-runs", r.owner, r.repo, head_sha),
+                &format!(
+                    "/repos/{}/{}/commits/{}/check-runs",
+                    r.owner, r.repo, head_sha
+                ),
                 &[],
                 None,
                 &[],

@@ -175,8 +175,11 @@ impl GithubMcp {
                         } else {
                             "dir"
                         };
-                        let path =
-                            t.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let path = t
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let size = t.get("size").and_then(|v| v.as_i64());
                         (kind.to_string(), path, size)
                     })
@@ -284,9 +287,7 @@ impl GithubMcp {
         let stripped: String = content_b64.chars().filter(|c| *c != '\n').collect();
         let decoded_bytes = base64::engine::general_purpose::STANDARD
             .decode(stripped.as_bytes())
-            .map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("base64 decode: {e}"), None)
-            })?;
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("base64 decode: {e}"), None))?;
         let decoded = String::from_utf8_lossy(&decoded_bytes).into_owned();
         let lines: Vec<&str> = decoded.split('\n').collect();
         let total = lines.len();
@@ -305,12 +306,7 @@ impl GithubMcp {
             let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
             (
                 slice,
-                format!(
-                    "{name} — Lines {}-{} of {}",
-                    start,
-                    end.min(total),
-                    total
-                ),
+                format!("{name} — Lines {}-{} of {}", start, end.min(total), total),
                 start,
             )
         } else {

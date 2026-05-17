@@ -103,7 +103,12 @@ impl GithubMcp {
         .await?;
         let mut summary = workflow_run_summary(&run);
         if let Some(obj) = summary.as_object_mut() {
-            obj.insert("run_attempt".into(), run.get("run_attempt").cloned().unwrap_or(serde_json::Value::Null));
+            obj.insert(
+                "run_attempt".into(),
+                run.get("run_attempt")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
         }
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&summary).unwrap_or_default(),

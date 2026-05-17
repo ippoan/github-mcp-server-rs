@@ -131,9 +131,8 @@ impl GithubMcp {
         // ci-dashboard 側は `new RegExp(pattern, "i")`。Rust の regex crate は
         // `(?i)` で case-insensitive を表現する。
         let pattern_ci = format!("(?i){}", args.pattern);
-        let re = regex::Regex::new(&pattern_ci).map_err(|e| {
-            rmcp::ErrorData::invalid_params(format!("invalid regex: {e}"), None)
-        })?;
+        let re = regex::Regex::new(&pattern_ci)
+            .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid regex: {e}"), None))?;
 
         let match_indices: Vec<usize> = lines
             .iter()

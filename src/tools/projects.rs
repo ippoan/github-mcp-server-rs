@@ -120,8 +120,13 @@ async fn get_project_fields(
         }
       }
     }"#;
-    let data: serde_json::Value =
-        github_graphql(client, token, query, serde_json::json!({ "id": project_id })).await?;
+    let data: serde_json::Value = github_graphql(
+        client,
+        token,
+        query,
+        serde_json::json!({ "id": project_id }),
+    )
+    .await?;
     Ok(data
         .get("node")
         .and_then(|v| v.get("fields"))
@@ -134,11 +139,19 @@ async fn get_project_fields(
 /// `get_project` の出力で field を要約。single_select option / iteration を flatten。
 fn summarize_field(f: &serde_json::Value) -> serde_json::Value {
     let mut base = serde_json::Map::new();
-    base.insert("id".into(), f.get("id").cloned().unwrap_or(serde_json::Value::Null));
-    base.insert("name".into(), f.get("name").cloned().unwrap_or(serde_json::Value::Null));
+    base.insert(
+        "id".into(),
+        f.get("id").cloned().unwrap_or(serde_json::Value::Null),
+    );
+    base.insert(
+        "name".into(),
+        f.get("name").cloned().unwrap_or(serde_json::Value::Null),
+    );
     base.insert(
         "dataType".into(),
-        f.get("dataType").cloned().unwrap_or(serde_json::Value::Null),
+        f.get("dataType")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     );
     if let Some(opts) = f.get("options").and_then(|v| v.as_array()) {
         let trimmed: Vec<serde_json::Value> = opts
@@ -395,11 +408,7 @@ impl GithubMcp {
             let filtered: Vec<serde_json::Value> = nodes
                 .iter()
                 .filter(|p| {
-                    include_closed
-                        || !p
-                            .get("closed")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
+                    include_closed || !p.get("closed").and_then(|v| v.as_bool()).unwrap_or(false)
                 })
                 .map(|p| {
                     serde_json::json!({
@@ -461,9 +470,7 @@ impl GithubMcp {
             serde_json::json!({ "login": args.org, "number": args.number }),
         )
         .await?;
-        let p = data
-            .get("repositoryOwner")
-            .and_then(|v| v.get("projectV2"));
+        let p = data.get("repositoryOwner").and_then(|v| v.get("projectV2"));
         let Some(p) = p else {
             return Err(GitHubApiError::Http {
                 status: 404,
@@ -681,12 +688,8 @@ impl GithubMcp {
             args.project_number,
         )
         .await?;
-        let fields = get_project_fields(
-            &self.ctx().client,
-            &self.ctx().github_token,
-            &project_id,
-        )
-        .await?;
+        let fields =
+            get_project_fields(&self.ctx().client, &self.ctx().github_token, &project_id).await?;
         let Some(field) = fields
             .iter()
             .find(|f| f.get("name").and_then(|v| v.as_str()) == Some(args.field_name.as_str()))
@@ -757,10 +760,7 @@ impl GithubMcp {
                 let Some(s) = args.value.as_str() else {
                     return Err(GitHubApiError::Http {
                         status: 400,
-                        body: format!(
-                            "Field {} (TEXT) requires a string value",
-                            args.field_name
-                        ),
+                        body: format!("Field {} (TEXT) requires a string value", args.field_name),
                     }
                     .into());
                 };
@@ -864,9 +864,9 @@ impl GithubMcp {
                         }
                     }
                 }
-                let it = all.iter().find(|i| {
-                    i.get("title").and_then(|v| v.as_str()) == Some(iter_title.as_str())
-                });
+                let it = all
+                    .iter()
+                    .find(|i| i.get("title").and_then(|v| v.as_str()) == Some(iter_title.as_str()));
                 let Some(it) = it else {
                     let avail: Vec<&str> = all
                         .iter()
@@ -998,7 +998,10 @@ impl GithubMcp {
                     })
                 })
                 .collect();
-            input.insert("singleSelectOptions".into(), serde_json::Value::Array(options));
+            input.insert(
+                "singleSelectOptions".into(),
+                serde_json::Value::Array(options),
+            );
         }
         let mutation = r#"mutation($input:CreateProjectV2FieldInput!){
           createProjectV2Field(input:$input){
@@ -1090,7 +1093,10 @@ impl GithubMcp {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let project_number = project.get("number").cloned().unwrap_or(serde_json::Value::Null);
+        let project_number = project
+            .get("number")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let mut result = serde_json::json!({
             "id": project.get("id"),
             "number": project_number,

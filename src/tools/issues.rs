@@ -92,10 +92,8 @@ impl GithubMcp {
         let r = parse_and_validate_repo(&args.repo)?;
         let state = args.state.unwrap_or_else(|| "open".to_string());
         let per_page = args.per_page.unwrap_or(20).clamp(1, 100);
-        let mut params: Vec<(&str, String)> = vec![
-            ("state", state),
-            ("per_page", per_page.to_string()),
-        ];
+        let mut params: Vec<(&str, String)> =
+            vec![("state", state), ("per_page", per_page.to_string())];
         if let Some(l) = args.labels {
             params.push(("labels", l));
         }
@@ -264,11 +262,7 @@ impl GithubMcp {
                         let repo = {
                             let segs: Vec<&str> = repo_url.split('/').collect();
                             if segs.len() >= 2 {
-                                format!(
-                                    "{}/{}",
-                                    segs[segs.len() - 2],
-                                    segs[segs.len() - 1]
-                                )
+                                format!("{}/{}", segs[segs.len() - 2], segs[segs.len() - 1])
                             } else {
                                 String::new()
                             }
@@ -397,10 +391,7 @@ impl GithubMcp {
                 None,
             ));
         }
-        let path = format!(
-            "/repos/{}/{}/issues/{}",
-            r.owner, r.repo, args.issue_number
-        );
+        let path = format!("/repos/{}/{}/issues/{}", r.owner, r.repo, args.issue_number);
         let updated: serde_json::Value = github_api_json(
             &self.ctx().client,
             &self.ctx().github_token,
@@ -465,9 +456,7 @@ impl GithubMcp {
     }
 
     /// Add labels to an issue or pull request. Returns the current label list.
-    #[tool(
-        description = "Add labels to an issue or pull request. Returns the current label list."
-    )]
+    #[tool(description = "Add labels to an issue or pull request. Returns the current label list.")]
     async fn add_labels(
         &self,
         Parameters(args): Parameters<AddLabelsArgs>,
@@ -556,17 +545,12 @@ impl GithubMcp {
         Parameters(args): Parameters<CloseIssueArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
-        let state_reason = args
-            .state_reason
-            .unwrap_or_else(|| "completed".to_string());
+        let state_reason = args.state_reason.unwrap_or_else(|| "completed".to_string());
         let payload = serde_json::json!({
             "state": "closed",
             "state_reason": state_reason,
         });
-        let path = format!(
-            "/repos/{}/{}/issues/{}",
-            r.owner, r.repo, args.issue_number
-        );
+        let path = format!("/repos/{}/{}/issues/{}", r.owner, r.repo, args.issue_number);
         let updated: serde_json::Value = github_api_json(
             &self.ctx().client,
             &self.ctx().github_token,
@@ -596,10 +580,7 @@ impl GithubMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
         let payload = serde_json::json!({ "state": "open" });
-        let path = format!(
-            "/repos/{}/{}/issues/{}",
-            r.owner, r.repo, args.issue_number
-        );
+        let path = format!("/repos/{}/{}/issues/{}", r.owner, r.repo, args.issue_number);
         let updated: serde_json::Value = github_api_json(
             &self.ctx().client,
             &self.ctx().github_token,

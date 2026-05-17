@@ -131,14 +131,11 @@ pub async fn github_graphql<T: DeserializeOwned>(
         "query": query,
         "variables": variables,
     });
-    let resp = apply_common_headers(
-        client.post(format!("{GITHUB_API}/graphql")),
-        token,
-    )
-    .header("Content-Type", "application/json")
-    .json(&body)
-    .send()
-    .await?;
+    let resp = apply_common_headers(client.post(format!("{GITHUB_API}/graphql")), token)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {

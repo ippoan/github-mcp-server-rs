@@ -44,7 +44,9 @@ fn short_sha(sha: &str) -> String {
 #[tool_router(router = commits_router, vis = "pub(crate)")]
 impl GithubMcp {
     /// List commits for a repository. Supports branch/tag and file path filtering.
-    #[tool(description = "List commits for a repository. Supports branch/tag and file path filtering.")]
+    #[tool(
+        description = "List commits for a repository. Supports branch/tag and file path filtering."
+    )]
     async fn list_commits(
         &self,
         Parameters(args): Parameters<ListCommitsArgs>,
@@ -52,10 +54,8 @@ impl GithubMcp {
         let r = parse_and_validate_repo(&args.repo)?;
         let sha = args.sha.unwrap_or_else(|| "main".to_string());
         let per_page = args.per_page.unwrap_or(20).clamp(1, 100);
-        let mut params: Vec<(&str, String)> = vec![
-            ("sha", sha),
-            ("per_page", per_page.to_string()),
-        ];
+        let mut params: Vec<(&str, String)> =
+            vec![("sha", sha), ("per_page", per_page.to_string())];
         if let Some(p) = args.path {
             params.push(("path", p));
         }
