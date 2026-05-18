@@ -27,8 +27,10 @@ on:
       - 'build.rs'
       - '.github/workflows/dev-release.yml'
       - '.github/workflows/release.yml'
-  # 手動でも叩けるように残す (paths filter で skip された後にやり直したい時用)。
-  workflow_dispatch:
+  # 手動 trigger は意図的に外している (ユーザー方針):
+  #   - dev release は "main 上の変更を機械的に追従する" だけの自動化が目的
+  #   - 手動で打ちたければ stable 用の /tag-release (semver) を使えばよい
+  #   - workflow_dispatch を残すと「手動で打ったか自動で打ったか」が運用上混ざる
 
 permissions:
   contents: write
