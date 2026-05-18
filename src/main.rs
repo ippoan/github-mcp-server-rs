@@ -14,6 +14,7 @@
 //!     3. build-time embed `MCP_INTERNAL_SECRET` (release binary に焼き込み — build.rs)
 //!     4. dev fallback `"dev-secret-do-not-use"` (本物 auth-worker は 401 を返す)
 
+mod admin_exec;
 mod auth;
 mod config;
 mod github_api;
@@ -300,6 +301,10 @@ async fn run_relay(
         github_token: active.github_token,
         github_login: active.github_login,
         scope: active.scope,
+        // Pass through the raw MCP JWT so admin tools can proxy via auth-worker
+        // `/mcp/admin/exec` (Authorization: Bearer <jwt>).
+        jwt: token.access_token.clone(),
+        auth_worker_origin: cfg.auth_base.clone(),
         client: client.clone(),
     });
 
@@ -412,6 +417,16 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // `--scope mcp.admin` is now a no-op as far as tool surface is concerned:
+    // admin tools are always exposed and authorized server-side via auth-worker
+    // `/mcp/elevate`. The scope value still flows into the device flow request
+    // for backward compat.
+    if cli.scope.split_whitespace().any(|s| s == "mcp.admin") {
+        eprintln!(
+            "Note: --scope=mcp.admin is now ignored; admin tools are always available \
+             and authorized server-side via auth-worker /mcp/elevate"
+        );
+    }
     let cfg = build_config(&cli)?;
     let client = Client::builder()
         .user_agent(concat!("github-mcp-server-rs/", env!("CARGO_PKG_VERSION")))
