@@ -81,16 +81,14 @@ impl GithubMcp {
         // 両方 set の JWT (superuser) は union になるが、通常は auth-worker pair flow で
         // requested_scope="mcp.admin" or "mcp.read mcp.write" のどちらかだけを mint する。
         let admin = scope_has(&ctx.scope, "mcp.admin");
-        let read_or_write =
-            scope_has(&ctx.scope, "mcp.read") || scope_has(&ctx.scope, "mcp.write");
+        let read_or_write = scope_has(&ctx.scope, "mcp.read") || scope_has(&ctx.scope, "mcp.write");
 
         let mut tool_router = Self::core_router();
         if admin {
-            tool_router = tool_router + Self::branches_router();
+            tool_router += Self::branches_router();
         }
         if read_or_write {
-            tool_router = tool_router
-                + Self::actions_router()
+            tool_router += Self::actions_router()
                 + Self::commits_router()
                 + Self::issues_router()
                 + Self::logs_router()
