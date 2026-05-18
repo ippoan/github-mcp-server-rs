@@ -1,0 +1,40 @@
+name: Dev Release
+
+# main 上の binary 関連変更を自動で `dev-N` タグとして打ち、release.yml に release
+# build + asset upload を委譲する。`/tag-release patch` を毎回手動で叩かなくて済む。
+#
+# 採番は `ippoan/ci-workflows/dev-tag-release.yml` reusable (counter モード) に
+# 委譲: 既存 `dev-*` タグの max N+1 を push する。同一 HEAD への再発火は skip。
+#
+# release.yml は `on: push: tags: ["v*", "dev-*"]` で両方を受ける。タグ名に
+# `-` を含むため rust-binary-release は自動で prerelease 扱い → `releases/latest`
+# には出ない → install-mcp.sh の stable channel には影響無し。
+#
+# install-mcp.sh から dev チャネルを選ぶには `GITHUB_MCP_CHANNEL=dev` を設定する
+# (詳細は .claude/hooks/install-mcp.sh の docstring 参照)。
+
+on:
+  push:
+    branches: [main]
+    # docs-only / hook-only PR では release を打たない (ノイズ削減)。
+    # binary 動作に影響する path だけを trigger に含める。
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'examples/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/dev-release.yml'
+      - '.github/workflows/release.yml'
+  # 手動でも叩けるように残す (paths filter で skip された後にやり直したい時用)。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dev-release:
+    uses: ippoan/ci-workflows/.github/workflows/dev-tag-release.yml@main
+    secrets:
+      TAG_RELEASE_PAT: ${{ secrets.TAG_RELEASE_PAT }}

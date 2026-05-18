@@ -1,15 +1,20 @@
 name: Release
 
-# tag push (v*) 起点で ippoan/ci-workflows の rust-binary-release reusable を呼び、
-# GitHub Release を作成 + バイナリを attach する。
+# tag push (v* / dev-*) 起点で ippoan/ci-workflows の rust-binary-release
+# reusable を呼び、GitHub Release を作成 + バイナリを attach する。
 #
-# 初回 tag: `gh workflow run tag-release.yml -R ippoan/github-mcp-server-rs` か
-#          `git tag v0.1.0 && git push origin v0.1.0` で起動。
-# tag に `-` 含まれていたら自動 prerelease (例: v0.2.0-rc1)。
+# 起動経路:
+#   - 正式 release: `tag-release.yml` (手動 workflow_dispatch) → `v{major}.{minor}.{patch}` push
+#   - 開発 release: `dev-release.yml` (main push 自動)         → `dev-{N}` push
+#
+# tag に `-` 含まれていたら自動 prerelease (例: `v0.2.0-rc1`, `dev-12`)。
+# prerelease は GitHub の `releases/latest` API に出ないので、stable channel の
+# install-mcp.sh consumer (default) には影響しない。dev channel consumer は
+# `GITHUB_MCP_CHANNEL=dev` を設定して `dev-*` の最大 N を解決する。
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "dev-*"]
 
 permissions:
   contents: write

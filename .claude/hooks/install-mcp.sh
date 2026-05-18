@@ -23,7 +23,11 @@
 #
 # Optional env (with defaults):
 #   GITHUB_MCP_ENV          staging|prod                          (default: staging)
-#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.6)         (default: latest)
+#   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.6, dev-12) (default: resolved per channel)
+#   GITHUB_MCP_CHANNEL      stable|dev                            (default: stable)
+#                                   - stable: GitHub `releases/latest` (= 正式 v0.0.X タグ)
+#                                   - dev:    `releases?per_page=100` から `dev-N` の max を解決
+#                                             (= main push の度に dev-release.yml が打つ prerelease)
 #   GITHUB_MCP_FORCE_REINSTALL=1  force re-download even when tag matches
 #   GITHUB_LOGIN            github username (REQUIRED on no-token path,
 #                                   used by 1-click pair flow as `claim_login`)
@@ -86,16 +90,35 @@ fi
 BIN="$INSTALL_DIR/github-mcp-server-rs"
 TAG_FILE="$BIN.tag"
 
+CHANNEL="${GITHUB_MCP_CHANNEL:-stable}"
 if [ -n "${GITHUB_MCP_PIN_TAG:-}" ]; then
   TAG="$GITHUB_MCP_PIN_TAG"
+elif [ "$CHANNEL" = "dev" ]; then
+  # dev channel: pick the highest `dev-N` tag from the all-releases listing.
+  # `/releases/latest` skips prereleases (= dev-* tags) so we have to scan
+  # `/releases?per_page=100`. 100 is GitHub's per-page cap; dev tags rotate
+  # fast enough that the latest one is always inside the most recent page.
+  echo "[install-mcp] resolving latest dev release tag (channel=dev)..." >&2
+  DEV_N="$(curl -sSfL "https://api.github.com/repos/$REPO/releases?per_page=100" \
+            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"dev-[0-9]+"' \
+            | cut -d'"' -f4 \
+            | sed 's|^dev-||' \
+            | sort -n \
+            | tail -1 || true)"
+  if [ -n "$DEV_N" ]; then
+    TAG="dev-$DEV_N"
+  fi
+elif [ "$CHANNEL" != "stable" ]; then
+  echo "[install-mcp] ERROR: unknown GITHUB_MCP_CHANNEL=$CHANNEL (expected: stable, dev)" >&2
+  exit 1
 else
-  echo "[install-mcp] resolving latest release tag..." >&2
+  echo "[install-mcp] resolving latest release tag (channel=stable)..." >&2
   TAG="$(curl -sSfL "https://api.github.com/repos/$REPO/releases/latest" \
           | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
           | head -1 | cut -d'"' -f4)"
 fi
 if [ -z "${TAG:-}" ]; then
-  echo "[install-mcp] ERROR: could not resolve a release tag for $REPO" >&2
+  echo "[install-mcp] ERROR: could not resolve a release tag for $REPO (channel=$CHANNEL)" >&2
   exit 1
 fi
 
@@ -106,11 +129,12 @@ INSTALLED_TAG=""
 # via build.rs (`BUILD_RELEASE_TAG` from `GITHUB_REF_NAME` on tag push),
 # and clap prints it in parentheses, e.g.:
 #   github-mcp-server-rs 0.1.0 (v0.0.11)
-# Dev/local builds emit no parens, so $EMBEDDED_TAG stays empty.
+#   github-mcp-server-rs 0.1.0 (dev-12)
+# Dev/local builds (no tag push) emit no parens, so $EMBEDDED_TAG stays empty.
 EMBEDDED_TAG=""
 if [ -x "$BIN" ]; then
   EMBEDDED_TAG="$("$BIN" --version 2>/dev/null \
-    | grep -oE '\(v[0-9][^)]*\)' \
+    | grep -oE '\((v[0-9]|dev-)[^)]*\)' \
     | head -1 \
     | tr -d '()' || true)"
 fi
