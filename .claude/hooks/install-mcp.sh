@@ -250,10 +250,15 @@ if [ ! -f "$TOKEN_FILE" ]; then
 
     # Wait up to 5s for the binary to surface a pair_url line; the POST is
     # quick (<300 ms on staging) so 5s is generous.
+    #
+    # The regex requires {30,60} characters after `/mcp/pair/` to mirror the
+    # server-side `PAIR_CODE_REGEX = /^[A-Za-z0-9_-]{30,60}$/` and skip the
+    # bare `/mcp/pair/new` POST URL that the binary logs to stderr before the
+    # actual pair_url lands on stdout (smoke test 2026-05-18 bug).
     LINK=""
     for _ in $(seq 1 5); do
-      if grep -qE 'https?://[^[:space:]]+/mcp/pair/' "$STATE_DIR/pair.log" 2>/dev/null; then
-        LINK="$(grep -oE 'https?://[^[:space:]]+/mcp/pair/[A-Za-z0-9_-]+' "$STATE_DIR/pair.log" \
+      if grep -qE 'https?://[^[:space:]]+/mcp/pair/[A-Za-z0-9_-]{30,60}([[:space:]]|$)' "$STATE_DIR/pair.log" 2>/dev/null; then
+        LINK="$(grep -oE 'https?://[^[:space:]]+/mcp/pair/[A-Za-z0-9_-]{30,60}' "$STATE_DIR/pair.log" \
                 | head -1 || true)"
         [ -n "$LINK" ] && break
       fi
