@@ -39,6 +39,8 @@ use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 use tower::Service;
 
 // ----- src/ を test crate に mount (mod 名は src/ と一致) -----
+#[path = "../src/admin_exec.rs"]
+mod admin_exec;
 #[path = "../src/auth.rs"]
 mod auth;
 #[path = "../src/config.rs"]

@@ -1,11 +1,12 @@
-//! Branch protection tools — wraps the GitHub Branches API
-//! (`/repos/{owner}/{repo}/branches/{branch}/protection`).
+//! Branch protection tools — proxy through auth-worker `/mcp/admin/exec`.
 //!
-//! All three tools require the caller token to have `administration:write`
-//! on the target repo. `parse_and_validate_repo` enforces the org allowlist
-//! before any API call goes out.
+//! Phase 2: the binary no longer calls the GitHub Branches API directly.
+//! Instead, each tool POSTs `{tool, args}` to auth-worker, which holds the
+//! high-privilege GitHub App installation token and gates the call behind a
+//! short-lived (15min) browser-issued elevate flag. Calling an admin tool
+//! without an active elevate flag returns a user-facing error pointing at
+//! `/mcp/elevate`.
 
-use reqwest::Method;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content},
@@ -13,8 +14,10 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::{json, Value};
 
-use crate::github_api::{github_api_json, parse_and_validate_repo};
+use crate::admin_exec::{admin_exec, to_rmcp_error};
+use crate::github_api::parse_and_validate_repo;
 use crate::mcp_server::GithubMcp;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -80,10 +83,11 @@ pub struct DeleteBranchProtectionArgs {
 
 #[tool_router(router = branches_router, vis = "pub(crate)")]
 impl GithubMcp {
-    /// Apply branch protection.  Calls `PUT /repos/{owner}/{repo}/branches/{branch}/protection`.
-    /// Requires `administration:write` on the caller token.
+    /// Apply branch protection. Proxies to auth-worker `/mcp/admin/exec` which
+    /// performs the actual `PUT /repos/{owner}/{repo}/branches/{branch}/protection`
+    /// with a GitHub App installation token (server-side).
     #[tool(
-        description = "Apply or update branch protection on a repository branch. Requires administration:write scope. See SetBranchProtectionArgs for the rule knobs (required checks, conversation resolution, force-push / deletion gates, optional review requirement)."
+        description = "Apply or update branch protection on a repository branch. Proxied via auth-worker /mcp/admin/exec; requires a browser-issued elevate flag (15min TTL). See SetBranchProtectionArgs for the rule knobs (required checks, conversation resolution, force-push / deletion gates, optional review requirement)."
     )]
     async fn set_branch_protection(
         &self,
@@ -91,8 +95,8 @@ impl GithubMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
 
-        let mut payload = serde_json::Map::new();
-
+        // Build the full args payload sent to auth-worker. The worker
+        // re-validates owner/repo/branch and assembles the GitHub PUT body.
         let checks: Vec<String> = args
             .required_checks
             .unwrap_or_default()
@@ -100,72 +104,32 @@ impl GithubMcp {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if checks.is_empty() {
-            payload.insert("required_status_checks".into(), serde_json::Value::Null);
-        } else {
-            payload.insert(
-                "required_status_checks".into(),
-                serde_json::json!({
-                    "strict": args.strict_required_checks,
-                    "contexts": checks,
-                }),
-            );
-        }
 
-        match args.required_approving_review_count {
-            Some(n) if n > 0 => {
-                payload.insert(
-                    "required_pull_request_reviews".into(),
-                    serde_json::json!({
-                        "required_approving_review_count": n,
-                        "dismiss_stale_reviews": args.dismiss_stale_reviews,
-                    }),
-                );
-            }
-            _ => {
-                payload.insert(
-                    "required_pull_request_reviews".into(),
-                    serde_json::Value::Null,
-                );
-            }
-        }
+        let payload = json!({
+            "owner": r.owner,
+            "repo": r.repo,
+            "branch": args.branch,
+            "required_checks": checks,
+            "strict_required_checks": args.strict_required_checks,
+            "enforce_admins": args.enforce_admins,
+            "required_conversation_resolution": args.required_conversation_resolution,
+            "allow_force_pushes": args.allow_force_pushes,
+            "allow_deletions": args.allow_deletions,
+            "required_linear_history": args.required_linear_history,
+            "required_approving_review_count": args.required_approving_review_count,
+            "dismiss_stale_reviews": args.dismiss_stale_reviews,
+        });
 
-        payload.insert(
-            "enforce_admins".into(),
-            serde_json::Value::Bool(args.enforce_admins),
-        );
-        payload.insert("restrictions".into(), serde_json::Value::Null);
-        payload.insert(
-            "required_linear_history".into(),
-            serde_json::Value::Bool(args.required_linear_history),
-        );
-        payload.insert(
-            "allow_force_pushes".into(),
-            serde_json::Value::Bool(args.allow_force_pushes),
-        );
-        payload.insert(
-            "allow_deletions".into(),
-            serde_json::Value::Bool(args.allow_deletions),
-        );
-        payload.insert(
-            "required_conversation_resolution".into(),
-            serde_json::Value::Bool(args.required_conversation_resolution),
-        );
-
-        let path = format!(
-            "/repos/{}/{}/branches/{}/protection",
-            r.owner, r.repo, args.branch
-        );
-        let resp: serde_json::Value = github_api_json(
+        let resp: Value = admin_exec(
             &self.ctx().client,
-            &self.ctx().github_token,
-            Method::PUT,
-            &path,
-            &[],
-            Some(&serde_json::Value::Object(payload)),
-            &[],
+            &self.ctx().auth_worker_origin,
+            &self.ctx().jwt,
+            "set_branch_protection",
+            payload,
         )
-        .await?;
+        .await
+        .map_err(to_rmcp_error)?;
+
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Branch protection applied on {}/{}@{}\n\n{}",
             r.owner,
@@ -175,58 +139,55 @@ impl GithubMcp {
         ))]))
     }
 
-    /// Fetch the current branch protection.
-    /// Returns the raw GitHub response so callers can diff before re-applying.
+    /// Fetch the current branch protection. Proxies to auth-worker.
     #[tool(
-        description = "Get the current branch protection settings for a branch. Returns the raw GitHub API response."
+        description = "Get the current branch protection settings for a branch. Proxied via auth-worker /mcp/admin/exec; requires a browser-issued elevate flag. Returns the raw GitHub API response."
     )]
     async fn get_branch_protection(
         &self,
         Parameters(args): Parameters<GetBranchProtectionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
-        let path = format!(
-            "/repos/{}/{}/branches/{}/protection",
-            r.owner, r.repo, args.branch
-        );
-        let resp: serde_json::Value = github_api_json(
+        let resp: Value = admin_exec(
             &self.ctx().client,
-            &self.ctx().github_token,
-            Method::GET,
-            &path,
-            &[],
-            None,
-            &[],
+            &self.ctx().auth_worker_origin,
+            &self.ctx().jwt,
+            "get_branch_protection",
+            json!({
+                "owner": r.owner,
+                "repo": r.repo,
+                "branch": args.branch,
+            }),
         )
-        .await?;
+        .await
+        .map_err(to_rmcp_error)?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()),
         )]))
     }
 
-    /// Remove all branch protection from a branch.
+    /// Remove all branch protection from a branch. Proxies to auth-worker.
     #[tool(
-        description = "Remove branch protection from a branch. Requires administration:write scope."
+        description = "Remove branch protection from a branch. Proxied via auth-worker /mcp/admin/exec; requires a browser-issued elevate flag (15min TTL)."
     )]
     async fn delete_branch_protection(
         &self,
         Parameters(args): Parameters<DeleteBranchProtectionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
-        let path = format!(
-            "/repos/{}/{}/branches/{}/protection",
-            r.owner, r.repo, args.branch
-        );
-        let _: serde_json::Value = github_api_json(
+        let _: Value = admin_exec(
             &self.ctx().client,
-            &self.ctx().github_token,
-            Method::DELETE,
-            &path,
-            &[],
-            None,
-            &[],
+            &self.ctx().auth_worker_origin,
+            &self.ctx().jwt,
+            "delete_branch_protection",
+            json!({
+                "owner": r.owner,
+                "repo": r.repo,
+                "branch": args.branch,
+            }),
         )
-        .await?;
+        .await
+        .map_err(to_rmcp_error)?;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Branch protection removed from {}/{}@{}",
             r.owner, r.repo, args.branch

@@ -14,6 +14,7 @@
 //!     3. build-time embed `MCP_INTERNAL_SECRET` (release binary に焼き込み — build.rs)
 //!     4. dev fallback `"dev-secret-do-not-use"` (本物 auth-worker は 401 を返す)
 
+mod admin_exec;
 mod auth;
 mod config;
 mod github_api;
