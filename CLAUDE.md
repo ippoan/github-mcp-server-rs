@@ -48,9 +48,29 @@ binary 側に `✓ pair: WS upgrade accepted` が出れば成功。
 
 | 操作 | コマンド / 参照 |
 |---|---|
-| Release tag を切る | `/tag-release patch` (= GitHub Actions が release asset + sha256 を build & upload) |
+| 正式 release tag を切る | `/tag-release patch` (= manual workflow_dispatch、`v{major}.{minor}.{patch}`) |
+| 開発 release | **自動** — main への src 系 push で `dev-release.yml` が `dev-{N}` を採番して push (counter) |
 | Smoke test 実行 | `docs/smoke-tests/2026-05-18-pair-flow.md` の Re-test plan section |
 | 結果記録 | `docs/smoke-tests/YYYY-MM-DD-<topic>.md` に `## Re-run YYYY-MM-DD — PASS/FAIL` を追記 |
+
+### 開発 release (dev channel) の使い方
+
+main に binary 関連変更 (`src/**`, `Cargo.{toml,lock}`, `build.rs`, release workflow) が
+merge される度に `.github/workflows/dev-release.yml` が走り、`dev-N` タグを 1 個採番して
+push する。`release.yml` がそれを拾って GitHub Release を **prerelease** として作成
+(タグに `-` を含むので auto prerelease)。`releases/latest` API には出ないので
+stable consumer (= default の `GITHUB_MCP_CHANNEL=stable`) は影響を受けない。
+
+dev release を試したい consumer は session 起動前に env を立てる:
+
+```bash
+# CCoW Settings → Environment variables, または手動 hook 実行時
+export GITHUB_MCP_CHANNEL=dev
+bash .claude/hooks/install-mcp.sh
+```
+
+install-mcp.sh が `/releases?per_page=100` から `dev-N` の最大 N を解決して
+download する。`GITHUB_MCP_PIN_TAG=dev-5` で個別 pin も可能。
 
 ## Branch convention
 
