@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::admin_exec::{admin_exec, to_rmcp_error};
+use crate::admin_exec::{admin_exec_with_refresh, to_rmcp_error};
 use crate::github_api::parse_and_validate_repo;
 use crate::mcp_server::GithubMcp;
 
@@ -120,15 +120,9 @@ impl GithubMcp {
             "dismiss_stale_reviews": args.dismiss_stale_reviews,
         });
 
-        let resp: Value = admin_exec(
-            &self.ctx().client,
-            &self.ctx().auth_worker_origin,
-            &self.ctx().jwt,
-            "set_branch_protection",
-            payload,
-        )
-        .await
-        .map_err(to_rmcp_error)?;
+        let resp: Value = admin_exec_with_refresh(self.ctx(), "set_branch_protection", payload)
+            .await
+            .map_err(to_rmcp_error)?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Branch protection applied on {}/{}@{}\n\n{}",
@@ -148,10 +142,8 @@ impl GithubMcp {
         Parameters(args): Parameters<GetBranchProtectionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
-        let resp: Value = admin_exec(
-            &self.ctx().client,
-            &self.ctx().auth_worker_origin,
-            &self.ctx().jwt,
+        let resp: Value = admin_exec_with_refresh(
+            self.ctx(),
             "get_branch_protection",
             json!({
                 "owner": r.owner,
@@ -175,10 +167,8 @@ impl GithubMcp {
         Parameters(args): Parameters<DeleteBranchProtectionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let r = parse_and_validate_repo(&args.repo)?;
-        let _: Value = admin_exec(
-            &self.ctx().client,
-            &self.ctx().auth_worker_origin,
-            &self.ctx().jwt,
+        let _: Value = admin_exec_with_refresh(
+            self.ctx(),
             "delete_branch_protection",
             json!({
                 "owner": r.owner,
