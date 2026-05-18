@@ -460,7 +460,9 @@ async fn run_pair(
         github_login: login.clone(),
         scope: cfg.scope.clone(),
         token: empty_token,
-        token_cache_path: cfg.token_cache_path().unwrap_or_else(|_| PathBuf::from("/tmp/pair-no-cache")),
+        token_cache_path: cfg
+            .token_cache_path()
+            .unwrap_or_else(|_| PathBuf::from("/tmp/pair-no-cache")),
         cfg: Arc::new(cfg.clone()),
         client: client.clone(),
     });

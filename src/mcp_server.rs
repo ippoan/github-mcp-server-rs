@@ -223,8 +223,8 @@ mod tests {
     use super::*;
 
     fn build_mcp(scope: &str) -> GithubMcp {
-        use chrono::Utc;
         use crate::config::AuthEnv;
+        use chrono::Utc;
         let cfg = Arc::new(Config {
             env: AuthEnv::Staging,
             auth_base: "https://auth.test.invalid".to_string(),

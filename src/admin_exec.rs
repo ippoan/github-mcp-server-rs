@@ -286,10 +286,7 @@ fn is_auth_failure(e: &anyhow::Error) -> bool {
 /// expired-but-genuine binary can recover. The KV entry is one-shot (deleted
 /// after read) and bound to the `sub` claim of the presented JWT.
 async fn try_jwt_pickup(ctx: &GithubContext) -> Result<Option<TokenSet>> {
-    let url = format!(
-        "{}/mcp/jwt/pickup",
-        ctx.cfg.auth_base.trim_end_matches('/')
-    );
+    let url = format!("{}/mcp/jwt/pickup", ctx.cfg.auth_base.trim_end_matches('/'));
     let jwt = ctx.token.read().await.access_token.clone();
     if jwt.is_empty() {
         return Ok(None);
@@ -307,7 +304,10 @@ async fn try_jwt_pickup(ctx: &GithubContext) -> Result<Option<TokenSet>> {
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("/mcp/jwt/pickup: HTTP {status} — {}", truncate(&body)));
+        return Err(anyhow!(
+            "/mcp/jwt/pickup: HTTP {status} — {}",
+            truncate(&body)
+        ));
     }
     let body: PickupResponse = resp
         .json()
@@ -808,7 +808,10 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Admin tool set_branch_protection failed"), "msg={msg}");
+        assert!(
+            msg.contains("Admin tool set_branch_protection failed"),
+            "msg={msg}"
+        );
         assert!(msg.contains("/mcp/elevate"), "msg={msg}");
         assert!(msg.contains("local refresh also failed"), "msg={msg}");
     }
