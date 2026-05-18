@@ -20,6 +20,7 @@ mod config;
 mod github_api;
 mod introspect;
 mod mcp_server;
+mod pair;
 mod relay;
 mod token_cache;
 mod tools;
@@ -38,7 +39,7 @@ use rmcp::transport::streamable_http_server::{
 };
 
 use crate::config::{AuthEnv, Config};
-use crate::relay::RelayContext;
+use crate::relay::{PairRelayContext, RelayContext};
 use crate::token_cache::TokenSet;
 
 /// `--version` 出力に焼き込む文字列。
@@ -129,6 +130,30 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Status sentinel (install-mcp.sh が grep する) を stdout に出力する。
+        #[arg(long, default_value_t = true)]
+        print_status: bool,
+    },
+    /// Run the 1-click pair flow (issue #42, paired with auth-worker #144).
+    ///
+    /// Self-contained: `POST /mcp/pair/new` → pair_url を **stdout** に 1 行印字
+    /// → `Authorization: Bearer <pair_code>` で WS upgrade を polling
+    /// (401 + `Pair-Status: pending` → 2s sleep retry, 最大 pair_code TTL = 5min)
+    /// → 101 で frame bridge loop へ。WS が close したら `Ok(())` で抜ける
+    /// (pair_code は 1 回限り消費されるので reconnect しない)。
+    ///
+    /// Claude Code on the Web (CCoW) container では install-mcp.sh が本 subcommand を
+    /// nohup で background 起動し、stderr に出る pair_url を user に見せる。
+    /// device-flow (`auth` subcommand) は CLI / local dev / offline 用途に温存し、
+    /// `$GITHUB_MCP_AUTO_DEVICE_FLOW=1` で従来挙動に opt-in できる。
+    Pair {
+        /// github_login を明示。省略時は `$GITHUB_LOGIN` env を読む。両方未設定なら error。
+        #[arg(long, env = "GITHUB_LOGIN")]
+        user: Option<String>,
+        /// State directory (install-mcp.sh `$STATE_DIR`)。handshake 成功後に
+        /// `<state-dir>/url` に固定 public URL を書き出す。
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Status sentinel (install-mcp.sh が grep する) を stderr に出力する。
         #[arg(long, default_value_t = true)]
         print_status: bool,
     },
@@ -352,6 +377,104 @@ async fn run_relay(
     relay::run_relay(relay_ctx).await
 }
 
+/// `pair` subcommand: 1-click pair flow を全部 in-process で実行する (issue #42)。
+///
+/// install-mcp.sh から `nohup` で background 起動される前提。前に流れている
+/// stderr は install-mcp.sh が grep して user に見せる:
+///   1. `POST /mcp/pair/new` で pair_code / pair_url を取得
+///   2. pair_url を **stdout** に 1 行だけ印字 (install-mcp.sh が `grep -oE`)
+///   3. WS upgrade を polling (`Pair-Status: pending` → 2s sleep)
+///   4. 101 で frame bridge loop に合流 → WS close で exit
+async fn run_pair(
+    client: &Client,
+    cfg: &Config,
+    user: Option<String>,
+    state_dir: Option<PathBuf>,
+    print_status: bool,
+) -> Result<()> {
+    // ── 1. resolve login ────────────────────────────────────────────────
+    let login = match user.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(anyhow!(
+                "pair: github login not provided.\n\
+                 \n\
+                 hint: pass `--user <github_login>` or set `$GITHUB_LOGIN` in the\n\
+                       environment (Claude Code on the Web: Settings → Environment\n\
+                       variables → add `GITHUB_LOGIN=<your-github-username>`).\n\
+                 \n\
+                 The username is needed so the auth-worker can match your browser\n\
+                 cookie session against the pair_code your binary just minted."
+            ));
+        }
+    };
+
+    // ── 2. POST /mcp/pair/new ───────────────────────────────────────────
+    let binary_version = VERSION; // `0.1.0` or `0.1.0 (v0.0.x)`
+    if print_status {
+        eprintln!(
+            "→ pair: POST {} (claim_login={login}, binary_version=\"{binary_version}\")",
+            cfg.pair_new_url()
+        );
+    }
+    let resp = pair::pair_new(client, cfg, &login, binary_version).await?;
+
+    // ── 3. surface pair_url on stdout — install-mcp.sh grep target ──────
+    // **stdout** (not stderr): install-mcp.sh redirects stdout+stderr into the
+    // same log file via `>$STATE_DIR/pair.log 2>&1` and greps the URL out, but
+    // emitting via println! keeps the URL also reachable if the hook ever
+    // separates the two streams (e.g. piping stdout into a notifier).
+    println!("{}", resp.pair_url);
+    if print_status {
+        eprintln!(
+            "⇒ pair_url surfaced (expires in {}s, pair_code len={})",
+            resp.expires_in,
+            resp.pair_code.len()
+        );
+        eprintln!("   {}", resp.pair_url);
+    }
+
+    // ── 4. build degraded GithubContext + StreamableHttpService ─────────
+    // Pair flow は WS 接続専用 (`mcp-pair-callback.ts` の docstring に明記)。
+    // `whoami` 以上の tool は github_token / jwt を必要とし pair mode では失敗するが、
+    // `tools/list` は context state に依存せず 40 tools を返す。
+    // 完全な tool 動作には device-flow (`auth` subcommand) か pre-staged
+    // `$GITHUB_MCP_TOKEN_JSON` が引き続き必要 — 本 issue の out of scope。
+    let ctx = Arc::new(GithubContext {
+        github_token: String::new(),
+        github_login: login.clone(),
+        scope: cfg.scope.clone(),
+        jwt: String::new(),
+        auth_worker_origin: cfg.auth_base.clone(),
+        client: client.clone(),
+    });
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Some(host) = relay_host_from_base(&cfg.relay_base) {
+        allowed_hosts.push(host);
+    }
+    let factory_ctx = ctx.clone();
+    let svc: StreamableHttpService<GithubMcp, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(GithubMcp::new(factory_ctx.clone())),
+        Default::default(),
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_allowed_hosts(allowed_hosts),
+    );
+
+    // ── 5. WS upgrade + frame loop ──────────────────────────────────────
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(resp.expires_in.clamp(60, 600));
+    let pair_ctx = PairRelayContext {
+        cfg: Arc::new(cfg.clone()),
+        login,
+        svc,
+        state_dir,
+        print_status,
+    };
+    relay::run_pair_session(pair_ctx, resp.pair_code, deadline).await
+}
+
 /// `https://mcp-staging.ippoan.org` / `wss://mcp.ippoan.org` / `http://127.0.0.1:18099` 等から
 /// `host[:port]` を抽出する (rmcp `with_allowed_hosts` に渡す用)。scheme prefix が
 /// 認識できなければ None。trailing `/path` も削除する。
@@ -444,6 +567,11 @@ async fn main() -> Result<()> {
             state_dir,
             print_status,
         } => run_relay(&client, &cfg, user, state_dir, print_status).await,
+        Command::Pair {
+            user,
+            state_dir,
+            print_status,
+        } => run_pair(&client, &cfg, user, state_dir, print_status).await,
     }
 }
 

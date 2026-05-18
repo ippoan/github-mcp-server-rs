@@ -25,6 +25,11 @@
 #   GITHUB_MCP_ENV          staging|prod                          (default: staging)
 #   GITHUB_MCP_PIN_TAG      pin release tag (e.g. v0.0.6)         (default: latest)
 #   GITHUB_MCP_FORCE_REINSTALL=1  force re-download even when tag matches
+#   GITHUB_LOGIN            github username (REQUIRED on no-token path,
+#                                   used by 1-click pair flow as `claim_login`)
+#   GITHUB_MCP_AUTO_DEVICE_FLOW=1   opt-in to the legacy RFC 8628 device-code
+#                                   prompt instead of the 1-click pair flow
+#                                   (advanced; CLI / local dev / offline).
 #
 # Override (advanced; 通常は不要):
 #   GITHUB_MCP_INTERNAL_SHARED_SECRET — embed されている値を上書きしたい時のみ
@@ -183,61 +188,182 @@ if [ ! -f "$TOKEN_FILE" ] && [ -n "${GITHUB_MCP_TOKEN_JSON:-}" ]; then
   chmod 600 "$TOKEN_FILE"
 fi
 if [ ! -f "$TOKEN_FILE" ]; then
-  echo "" >&2
-  echo "[install-mcp] ───── device authorization required (env=$ENV_NAME) ─────" >&2
-  echo "[install-mcp] OPEN the verification_uri_complete URL printed below in a" >&2
-  echo "[install-mcp] browser, sign in with GitHub, and Approve.  The hook will" >&2
-  echo "[install-mcp] block until polling completes." >&2
-  echo "[install-mcp]" >&2
-  echo "[install-mcp] Tip: to skip this prompt on future fresh containers, copy" >&2
-  echo "[install-mcp]   $TOKEN_FILE" >&2
-  echo "[install-mcp] into a CCoW Setup-script secret named GITHUB_MCP_TOKEN_JSON." >&2
-  echo "" >&2
-  "$BIN" auth --env "$ENV_NAME" >&2
+  if [ "${GITHUB_MCP_AUTO_DEVICE_FLOW:-}" = "1" ]; then
+    # ─── Legacy RFC 8628 device-code path (opt-in) ─────────────────────────
+    # Kept for CLI / local dev / offline where a sticky browser cookie
+    # session against `auth(-staging).ippoan.org` is impractical. CCoW
+    # containers should prefer the 1-click pair path below.
+    echo "" >&2
+    echo "[install-mcp] ───── device authorization required (env=$ENV_NAME) ─────" >&2
+    echo "[install-mcp] (\$GITHUB_MCP_AUTO_DEVICE_FLOW=1 opt-in path)" >&2
+    echo "[install-mcp] OPEN the verification_uri_complete URL printed below in a" >&2
+    echo "[install-mcp] browser, sign in with GitHub, and Approve.  The hook will" >&2
+    echo "[install-mcp] block until polling completes." >&2
+    echo "[install-mcp]" >&2
+    echo "[install-mcp] Tip: to skip this prompt on future fresh containers, copy" >&2
+    echo "[install-mcp]   $TOKEN_FILE" >&2
+    echo "[install-mcp] into a CCoW Setup-script secret named GITHUB_MCP_TOKEN_JSON." >&2
+    echo "" >&2
+    "$BIN" auth --env "$ENV_NAME" >&2
+  else
+    # ─── 1-click pair flow (default, issue #42) ────────────────────────────
+    # The binary's `pair` subcommand is self-contained: it POSTs to
+    # /mcp/pair/new, prints the pair_url to stdout, polls the WS upgrade
+    # with `Pair-Status: pending` retries, and on 101 enters the frame
+    # bridge loop. We launch it in the background, capture the pair_url
+    # from its log, then surface it to the user. Step 4 (`relay` launch)
+    # is skipped because `pair` already runs the bridge inline.
+    if [ -z "${GITHUB_LOGIN:-}" ]; then
+      echo "" >&2
+      echo "[install-mcp] ERROR: \$GITHUB_LOGIN is not set, and no token cache exists." >&2
+      echo "[install-mcp]" >&2
+      echo "[install-mcp] The 1-click pair flow needs to know your GitHub username so" >&2
+      echo "[install-mcp] the auth-worker can match your browser cookie session against" >&2
+      echo "[install-mcp] the pair_code this binary mints. Add it as an env var:" >&2
+      echo "[install-mcp]" >&2
+      echo "[install-mcp]   Claude Code on the Web → Settings → Environment variables" >&2
+      echo "[install-mcp]   GITHUB_LOGIN=<your-github-username>" >&2
+      echo "[install-mcp]" >&2
+      echo "[install-mcp] Alternatively, set \$GITHUB_MCP_AUTO_DEVICE_FLOW=1 to fall" >&2
+      echo "[install-mcp] back to the legacy RFC 8628 device-code prompt." >&2
+      exit 1
+    fi
+
+    # Reap any leftover pair / relay process from a previous container session
+    # before respawning (`relay.pid` is from the legacy step 4 path that we
+    # skip entirely in pair mode, but a v0.0.x binary may have written it).
+    for pidfile in "$STATE_DIR/pair.pid" "$STATE_DIR/relay.pid"; do
+      [ -f "$pidfile" ] || continue
+      old_pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        kill "$old_pid" 2>/dev/null || true
+      fi
+      rm -f "$pidfile"
+    done
+
+    : > "$STATE_DIR/pair.log"
+    nohup "$BIN" pair --env "$ENV_NAME" \
+        --user "$GITHUB_LOGIN" \
+        --state-dir "$STATE_DIR" \
+        > "$STATE_DIR/pair.log" 2>&1 &
+    echo $! > "$STATE_DIR/pair.pid"
+
+    # Wait up to 5s for the binary to surface a pair_url line; the POST is
+    # quick (<300 ms on staging) so 5s is generous.
+    LINK=""
+    for _ in $(seq 1 5); do
+      if grep -qE 'https?://[^[:space:]]+/mcp/pair/' "$STATE_DIR/pair.log" 2>/dev/null; then
+        LINK="$(grep -oE 'https?://[^[:space:]]+/mcp/pair/[A-Za-z0-9_-]+' "$STATE_DIR/pair.log" \
+                | head -1 || true)"
+        [ -n "$LINK" ] && break
+      fi
+      # If the binary died, surface the failure immediately instead of looping.
+      if ! kill -0 "$(cat "$STATE_DIR/pair.pid")" 2>/dev/null; then
+        echo "[install-mcp] ERROR: pair process exited during startup. Log:" >&2
+        tail -n 30 "$STATE_DIR/pair.log" >&2 || true
+        exit 1
+      fi
+      sleep 1
+    done
+
+    echo "" >&2
+    echo "[install-mcp] ─── 1-click pair required ────────────────────────" >&2
+    if [ -n "$LINK" ]; then
+      echo "[install-mcp]   → $LINK" >&2
+    else
+      echo "[install-mcp] (waiting; see $STATE_DIR/pair.log)" >&2
+    fi
+    echo "[install-mcp] open the link in a browser (auth.ippoan.org session is sticky;" >&2
+    echo "[install-mcp]   1 click should complete pair within ~5s)." >&2
+    echo "[install-mcp]" >&2
+    echo "[install-mcp] The binary will bridge MCP traffic as soon as you click. To" >&2
+    echo "[install-mcp] skip this step on future containers, drop the token cache JSON" >&2
+    echo "[install-mcp] into a CCoW Setup-script secret named \$GITHUB_MCP_TOKEN_JSON," >&2
+    echo "[install-mcp] or set \$GITHUB_MCP_AUTO_DEVICE_FLOW=1 for the legacy CLI prompt." >&2
+    echo "" >&2
+
+    # `pair` self-contained: it surfaces $STATE_DIR/url after WS handshake.
+    # Step 4 (legacy `relay` launch) is intentionally skipped.
+    PAIR_MODE=1
+  fi
 fi
 
 # ─── 4. (re)start relay in the background ─────────────────────────────────────
-if [ -f "$STATE_DIR/relay.pid" ]; then
-  old_pid="$(cat "$STATE_DIR/relay.pid" 2>/dev/null || true)"
-  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-    kill "$old_pid" 2>/dev/null || true
-    sleep 1
+# Skipped when the 1-click pair path took over (step 3 above): the `pair`
+# subcommand is self-contained — it both surfaces the pair_url AND runs the
+# WS frame bridge loop, so launching a second `relay` process would race on
+# `<state-dir>/url` and (worse) try a `relay`-mode handshake that requires a
+# device-flow token cache we do not have.
+if [ "${PAIR_MODE:-0}" != "1" ]; then
+  if [ -f "$STATE_DIR/relay.pid" ]; then
+    old_pid="$(cat "$STATE_DIR/relay.pid" 2>/dev/null || true)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+      sleep 1
+    fi
   fi
+
+  : > "$STATE_DIR/relay.log"
+  nohup "$BIN" relay --env "$ENV_NAME" --state-dir "$STATE_DIR" \
+    > "$STATE_DIR/relay.log" 2>&1 &
+  echo $! > "$STATE_DIR/relay.pid"
 fi
 
-: > "$STATE_DIR/relay.log"
-nohup "$BIN" relay --env "$ENV_NAME" --state-dir "$STATE_DIR" \
-  > "$STATE_DIR/relay.log" 2>&1 &
-echo $! > "$STATE_DIR/relay.pid"
-
-# ─── 5. wait for the relay to write the public URL state file ────────────────
-# binary は `--state-dir` の `<dir>/url` に固定 URL を書いてから WS connect を始める。
-# install-mcp.sh はその file 出現を待つ。30s で諦める。
-ready=0
-for _ in $(seq 1 30); do
-  if [ -s "$STATE_DIR/url" ]; then
-    ready=1; break
-  fi
-  if ! kill -0 "$(cat "$STATE_DIR/relay.pid")" 2>/dev/null; then
-    echo "[install-mcp] ERROR: relay process died during startup. Log:" >&2
+# ─── 5. publish MCP public URL ───────────────────────────────────────────────
+# In `relay` (device-flow) mode the binary writes the public URL to
+# `<state-dir>/url` only after it has done /mcp/introspect + WS handshake.
+# We poll for that file with a 30s budget.
+#
+# In `pair` mode the URL is purely a function of (env, github_login), so we
+# compute it up front instead — the user clicks the pair link asynchronously,
+# possibly long after this hook exits, and the bridge comes up at that point.
+if [ "${PAIR_MODE:-0}" = "1" ]; then
+  case "$ENV_NAME" in
+    prod)    MCP_HOST="mcp.ippoan.org" ;;
+    staging) MCP_HOST="mcp-staging.ippoan.org" ;;
+    *)       MCP_HOST="mcp-staging.ippoan.org" ;;
+  esac
+  MCP_URL="https://${MCP_HOST}/u/${GITHUB_LOGIN}/mcp"
+  echo "$MCP_URL" > "$STATE_DIR/url"
+else
+  ready=0
+  for _ in $(seq 1 30); do
+    if [ -s "$STATE_DIR/url" ]; then
+      ready=1; break
+    fi
+    if ! kill -0 "$(cat "$STATE_DIR/relay.pid")" 2>/dev/null; then
+      echo "[install-mcp] ERROR: relay process died during startup. Log:" >&2
+      tail -n 50 "$STATE_DIR/relay.log" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+  if [ "$ready" != "1" ]; then
+    echo "[install-mcp] ERROR: relay did not produce $STATE_DIR/url within 30s." >&2
     tail -n 50 "$STATE_DIR/relay.log" >&2 || true
     exit 1
   fi
-  sleep 1
-done
-if [ "$ready" != "1" ]; then
-  echo "[install-mcp] ERROR: relay did not produce $STATE_DIR/url within 30s." >&2
-  tail -n 50 "$STATE_DIR/relay.log" >&2 || true
-  exit 1
+  MCP_URL="$(cat "$STATE_DIR/url")"
 fi
 
-MCP_URL="$(cat "$STATE_DIR/url")"
 echo "$MCP_URL" > "$STATE_DIR/mcp-url"
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export GITHUB_MCP_URL=\"$MCP_URL\"" >> "$CLAUDE_ENV_FILE"
 fi
 
-cat >&2 <<EOF
+if [ "${PAIR_MODE:-0}" = "1" ]; then
+  cat >&2 <<EOF
+
+[install-mcp] ✓ github-mcp-server-rs is ready (pair mode, waiting on browser click).
+[install-mcp]   MCP URL (Streamable HTTP via auth-worker WS relay): $MCP_URL
+[install-mcp]   This URL is **stable** — register it once in Claude Code Web's MCP
+[install-mcp]   settings; the bridge comes up the moment you click the pair link above.
+[install-mcp]   Also exported as \$GITHUB_MCP_URL and written to:
+[install-mcp]     $STATE_DIR/mcp-url
+[install-mcp]   Pair log: $STATE_DIR/pair.log
+EOF
+else
+  cat >&2 <<EOF
 
 [install-mcp] ✓ github-mcp-server-rs is ready (relay mode).
 [install-mcp]   MCP URL (Streamable HTTP via auth-worker WS relay): $MCP_URL
@@ -247,3 +373,4 @@ cat >&2 <<EOF
 [install-mcp]     $STATE_DIR/mcp-url
 [install-mcp]   Relay log: $STATE_DIR/relay.log
 EOF
+fi
