@@ -119,9 +119,13 @@ mod tests {
             .await;
         let cfg = cfg_with_relay_base(&server.url());
         let client = Client::new();
-        let resp = pair_new(&client, &cfg, "alice", "0.1.0-test").await.unwrap();
+        let resp = pair_new(&client, &cfg, "alice", "0.1.0-test")
+            .await
+            .unwrap();
         assert_eq!(resp.pair_code.len(), 36);
-        assert!(resp.pair_url.starts_with("https://auth-x.example/mcp/pair/"));
+        assert!(resp
+            .pair_url
+            .starts_with("https://auth-x.example/mcp/pair/"));
         assert_eq!(resp.expires_in, 300);
         m.assert_async().await;
     }

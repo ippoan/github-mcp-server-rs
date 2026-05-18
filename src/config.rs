@@ -205,7 +205,10 @@ mod tests {
     #[test]
     fn pair_new_url_https_staging() {
         let c = cfg_with(AuthEnv::Staging, "https://mcp-staging.ippoan.org");
-        assert_eq!(c.pair_new_url(), "https://mcp-staging.ippoan.org/mcp/pair/new");
+        assert_eq!(
+            c.pair_new_url(),
+            "https://mcp-staging.ippoan.org/mcp/pair/new"
+        );
     }
 
     #[test]
@@ -217,7 +220,10 @@ mod tests {
     #[test]
     fn pair_new_url_strips_trailing_slash() {
         let c = cfg_with(AuthEnv::Staging, "https://mcp-staging.ippoan.org/");
-        assert_eq!(c.pair_new_url(), "https://mcp-staging.ippoan.org/mcp/pair/new");
+        assert_eq!(
+            c.pair_new_url(),
+            "https://mcp-staging.ippoan.org/mcp/pair/new"
+        );
     }
 
     #[test]
