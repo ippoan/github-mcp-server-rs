@@ -10,19 +10,13 @@
 //! issues, logs, pulls, releases, repository}` にあり、`GithubMcp::new` で
 //! `+` operator (`rmcp::ToolRouter: Add`) で scope に応じて subset を足し合わせる。
 //!
-//! ## Scope-based router factory (auth-worker#148 / consumer of `mcp.admin`)
+//! ## Router factory
 //!
-//! 1 binary 1 user 1 JWT の設計上、`ctx.scope` (= `/mcp/introspect` が返した JWT
-//! claim) を single source of truth として tool surface を出し分ける。
-//!
-//! - `mcp.admin`        → `branches_router` (set/get/delete_branch_protection)
-//! - `mcp.read|write`   → 既存の read/write router 群
-//! - 両方                 → union (テスト用の superuser セッション)
-//! - どちらも含まない → core のみ (defense-in-depth: whoami + list_repos)
-//!
-//! `mcp.admin` と read/write は **disjoint** として設計されているため、admin
-//! セッションからは issue / PR / push 系の副作用が出てこない (⚠ admin JWT を
-//! 誤って leak しても branch protection 以外は叩けない) — blast radius を最小化。
+//! - core (whoami / list_repos) は常に expose
+//! - branches_router (set/get/delete_branch_protection) も **常に** expose。
+//!   authorization は auth-worker `/mcp/admin/exec` の elevate flag (15min TTL,
+//!   browser-based one-tap) で server-side に行う。binary は proxy するだけ。
+//! - `mcp.read|write` scope → 既存の read/write router 群 (actions/commits/...)
 //!
 //! Token は in-memory cache のみ (1h で expire)。expire 後は再起動必要 (MVP)。
 //! 将来: refresh & introspect を background task で定期更新。
@@ -45,10 +39,16 @@ pub struct GithubContext {
     pub github_token: String,
     pub github_login: String,
     /// MCP JWT の `scope` claim (space-separated, e.g. `"mcp.read mcp.write"` or
-    /// `"mcp.admin"`)。`GithubMcp::new` の router factory がこの値を見て tool
-    /// subset を出し分けるため、auth-worker `/mcp/introspect` の戻り値を
-    /// そのまま詰めること (re-normalize しない)。
+    /// `"mcp.admin"`)。read/write 系 tool surface の judgement に使う。
+    /// admin tool は scope に依存せず常に expose され、authorization は
+    /// auth-worker `/mcp/admin/exec` 側の elevate flag で行われる。
     pub scope: String,
+    /// 生 MCP JWT (Bearer token)。admin tool が auth-worker `/mcp/admin/exec`
+    /// に proxy するときに `Authorization: Bearer <jwt>` として送る。
+    pub jwt: String,
+    /// auth-worker の origin (例: `https://auth.ippoan.org` / staging URL).
+    /// admin tool が `{auth_worker_origin}/mcp/admin/exec` を組み立てるのに使う。
+    pub auth_worker_origin: String,
     pub client: Client,
 }
 
@@ -73,20 +73,15 @@ fn scope_has(scope_str: &str, target: &str) -> bool {
 
 impl GithubMcp {
     pub fn new(ctx: Arc<GithubContext>) -> Self {
-        // 3 段階 scope factory (admin と read/write は disjoint):
-        //   - mcp.admin       → branches_router (set/get/delete_branch_protection)
-        //   - mcp.read|write  → 既存の read/write router (actions/commits/issues/...)
-        //   - core (whoami / list_repos) は常に含む
-        //
-        // 両方 set の JWT (superuser) は union になるが、通常は auth-worker pair flow で
-        // requested_scope="mcp.admin" or "mcp.read mcp.write" のどちらかだけを mint する。
-        let admin = scope_has(&ctx.scope, "mcp.admin");
+        // Admin tools (branch protection) are always exposed in the router.
+        // Authorization is enforced server-side via the auth-worker elevate flag
+        // (`POST /mcp/admin/exec`): calling an admin tool without an active
+        // elevate flag returns 403 from auth-worker, which we surface as a
+        // user-facing error pointing at the elevate URL. The `mcp.admin` JWT
+        // scope is no longer used as a gate on the binary side.
         let read_or_write = scope_has(&ctx.scope, "mcp.read") || scope_has(&ctx.scope, "mcp.write");
 
-        let mut tool_router = Self::core_router();
-        if admin {
-            tool_router += Self::branches_router();
-        }
+        let mut tool_router = Self::core_router() + Self::branches_router();
         if read_or_write {
             tool_router += Self::actions_router()
                 + Self::commits_router()
@@ -197,9 +192,10 @@ impl ServerHandler for GithubMcp {
             "GitHub MCP server backed by auth-worker (RFC 8628 device flow + introspect). \
              Tools surface depends on the JWT scope claim: \
              `mcp.read|write` exposes ci-dashboard-derived read/write tools \
-             (workflow runs / commits / issues / job logs / pull requests / tags / repository); \
-             `mcp.admin` exposes branch protection tools \
-             (set/get/delete_branch_protection) instead. \
+             (workflow runs / commits / issues / job logs / pull requests / tags / repository). \
+             Admin tools (set/get/delete_branch_protection) are always available; \
+             authorization is enforced server-side by auth-worker via a browser-based \
+             elevate flow (`/mcp/elevate`, 15min TTL). \
              whoami and list_repos are always available. \
              The github_token is auto-recovered from auth-worker KV via /mcp/introspect at \
              server startup."
@@ -219,6 +215,8 @@ mod tests {
             github_token: "x".to_string(),
             github_login: "x".to_string(),
             scope: scope.to_string(),
+            jwt: "test-jwt".to_string(),
+            auth_worker_origin: "https://auth.test.invalid".to_string(),
             client: Client::new(),
         });
         GithubMcp::new(ctx)
@@ -249,121 +247,100 @@ mod tests {
             names.contains(&"list_repos".to_string()),
             "list_repos missing"
         );
-        // branch protection tools は read+write JWT では見えないこと (defense-in-depth)
-        assert!(
-            !names.iter().any(|n| n == "set_branch_protection"),
-            "set_branch_protection leaked into mcp.read mcp.write scope"
-        );
-        assert!(
-            !names.iter().any(|n| n == "get_branch_protection"),
-            "get_branch_protection leaked into mcp.read mcp.write scope"
-        );
-        assert!(
-            !names.iter().any(|n| n == "delete_branch_protection"),
-            "delete_branch_protection leaked into mcp.read mcp.write scope"
-        );
-        // read+write には core (2) + 8 カテゴリの tool が含まれるので、最低限
-        // ちゃんと量があることを確認 (正確な個数は tool 追加で変わるので >= だけ使う)。
-        assert!(
-            names.len() >= 10,
-            "expected at least 10 tools for mcp.read mcp.write, got {}: {:?}",
-            names.len(),
-            names
-        );
-    }
-
-    #[test]
-    fn admin_only_scope_exposes_branch_protection_no_other_categories() {
-        let mcp = build_mcp("mcp.admin");
-        let names = tool_names(&mcp);
-        eprintln!(
-            "TOOL_DUMP (mcp.admin) count={} names={:?}",
-            names.len(),
-            names
-        );
-        // core は常に expose
-        assert!(names.iter().any(|n| n == "whoami"), "whoami missing");
-        assert!(
-            names.iter().any(|n| n == "list_repos"),
-            "list_repos missing"
-        );
-        // branch protection 3 tools が expose されている
+        // Admin tools are now always exposed (server-side authz via auth-worker
+        // `/mcp/admin/exec` elevate flag). Calling them without elevation
+        // returns a 403 surfaced as a user-friendly error.
         assert!(
             names.iter().any(|n| n == "set_branch_protection"),
-            "set_branch_protection missing for mcp.admin"
+            "set_branch_protection should always be exposed"
         );
         assert!(
             names.iter().any(|n| n == "get_branch_protection"),
-            "get_branch_protection missing for mcp.admin"
+            "get_branch_protection should always be exposed"
         );
         assert!(
             names.iter().any(|n| n == "delete_branch_protection"),
-            "delete_branch_protection missing for mcp.admin"
+            "delete_branch_protection should always be exposed"
         );
-        // それ以外のカテゴリ (actions/commits/issues/logs/projects/pulls/releases/repository) は一切見えないこと。
-        // 代表例として既知の tool 1 個づつを選んで negative assert するのではなく、
-        // count で一括チェック: core 2 + branches 3 = 5 のはず。
-        assert_eq!(
-            names.len(),
-            5,
-            "expected exactly 5 tools (2 core + 3 branches) for mcp.admin, got {}: {:?}",
+        // read+write には core (2) + branches (3) + 8 カテゴリの tool が含まれる。
+        assert!(
+            names.len() >= 13,
+            "expected at least 13 tools for mcp.read mcp.write, got {}: {:?}",
             names.len(),
             names
         );
     }
 
     #[test]
-    fn admin_and_write_combined_scope_exposes_union() {
-        let mcp = build_mcp("mcp.read mcp.write mcp.admin");
-        let names = tool_names(&mcp);
-        // 両方含まれること
-        assert!(
-            names.iter().any(|n| n == "set_branch_protection"),
-            "admin tools missing from union"
-        );
-        assert!(names.iter().any(|n| n == "whoami"), "core missing");
-        // count は admin-only (5) + read+write categories の合計以上
-        let admin_only = tool_names(&build_mcp("mcp.admin")).len();
-        let rw_only = tool_names(&build_mcp("mcp.read mcp.write")).len();
-        // union = admin_subset ∪ rw_subset = (admin_only + rw_only - core_overlap_2)
-        assert_eq!(names.len(), admin_only + rw_only - 2);
+    fn branches_always_exposed_regardless_of_scope() {
+        // Admin tools are always in the router; authorization is enforced
+        // server-side by auth-worker. Verify across multiple scope strings.
+        for scope in [
+            "",
+            "x garbage",
+            "mcp.read",
+            "mcp.read mcp.write",
+            "mcp.admin",
+            "mcp.read mcp.write mcp.admin",
+        ] {
+            let mcp = build_mcp(scope);
+            let names = tool_names(&mcp);
+            assert!(
+                names.iter().any(|n| n == "set_branch_protection"),
+                "set_branch_protection missing for scope={scope:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "get_branch_protection"),
+                "get_branch_protection missing for scope={scope:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "delete_branch_protection"),
+                "delete_branch_protection missing for scope={scope:?}"
+            );
+            assert!(names.iter().any(|n| n == "whoami"));
+            assert!(names.iter().any(|n| n == "list_repos"));
+        }
     }
 
     #[test]
-    fn empty_scope_exposes_core_only() {
+    fn empty_scope_exposes_core_plus_branches_only() {
         let mcp = build_mcp("");
         let names = tool_names(&mcp);
-        // defense-in-depth: 不明な JWT は core のみ、誤って admin tool に到達しない
+        // No read/write surface, but core + branches always expose.
+        // core (2) + branches (3) = 5
         assert_eq!(
-            names,
-            vec!["list_repos".to_string(), "whoami".to_string()],
-            "empty scope should expose only core tools"
+            names.len(),
+            5,
+            "expected exactly 5 tools (2 core + 3 branches) for empty scope, got {}: {:?}",
+            names.len(),
+            names
         );
+        assert!(names.iter().any(|n| n == "whoami"));
+        assert!(names.iter().any(|n| n == "list_repos"));
+        assert!(names.iter().any(|n| n == "set_branch_protection"));
     }
 
     #[test]
-    fn unknown_scope_exposes_core_only() {
-        // 以前の build_mcp() が使っていた scope="x" に相当。
+    fn unknown_scope_exposes_core_plus_branches_only() {
         let mcp = build_mcp("x garbage");
         let names = tool_names(&mcp);
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 5);
         assert!(names.iter().any(|n| n == "whoami"));
         assert!(names.iter().any(|n| n == "list_repos"));
+        assert!(names.iter().any(|n| n == "set_branch_protection"));
     }
 
     #[test]
     fn read_only_scope_exposes_read_write_routers() {
         // mcp.read のみでも read+write のカテゴリを見せる (この PR では read/write
-        // 内部のカテゴリ分離はしない、という設計判断。将来 mcp.read だけでは write 系
-        // (create_issue 等) を hide するよう tool レベルで filter を掛けると better、
-        // だがこれは Track A のスコープ外。
+        // 内部のカテゴリ分離はしない、という設計判断)。
         let mcp = build_mcp("mcp.read");
         let names = tool_names(&mcp);
         assert!(names.iter().any(|n| n == "whoami"));
-        // branch protection は見えない
-        assert!(!names.iter().any(|n| n == "set_branch_protection"));
-        // リードカテゴリの tool は見える (>= 10)
-        assert!(names.len() >= 10);
+        // admin tools are always exposed
+        assert!(names.iter().any(|n| n == "set_branch_protection"));
+        // リードカテゴリの tool は見える (>= 13 = 2 core + 3 branches + 8 categories)
+        assert!(names.len() >= 13);
     }
 
     #[test]
