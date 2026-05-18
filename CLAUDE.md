@@ -28,10 +28,12 @@ binary 側に `✓ pair: WS upgrade accepted` が出れば成功。
 
 ## Gotchas (smoke test 2026-05-18 で実機検証)
 
-- **`tools.listChanged: false`** が auth-worker 側で有効 (`src/handlers/mcp-tools.ts:384`)
-  なので、binary が後から WS attach しても Claude Code Web に tool list 更新 push が
-  飛ばない。pair 完了後は MCP entry を **1 回「切断 → 再接続」** して tools/list を
-  再取得すること。`5 tools (cc-relay stub) のまま増えない` 症状は大抵これ。
+- ~~`tools.listChanged: false`~~ → **issue #155 で解消**。auth-worker は
+  `tools.listChanged: true` を advertise し、binary attach/detach・elevate
+  完了の境界で `notifications/tools/list_changed` を broadcast する。pair
+  後の手動「切断 → 再接続」は不要 (Claude Code Web が spec 通り自発的に
+  `tools/list` を再 fetch する)。auth-worker 未デプロイの環境 (e.g. old
+  staging) では旧来通り手動再接続が必要。
 - **per-user URL `/u/<login>/mcp` が正**。bare `/mcp` も同じ DO に届くが (ADR-003
   user-less variant)、install-mcp.sh が書き出す per-user URL をそのまま使えば良い。
   URL 変更で tools が増えるわけではない (両方 binary attach 状態に依存)。
