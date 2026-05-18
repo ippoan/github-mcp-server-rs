@@ -18,8 +18,9 @@
 //!   browser-based one-tap) で server-side に行う。binary は proxy するだけ。
 //! - `mcp.read|write` scope → 既存の read/write router 群 (actions/commits/...)
 //!
-//! Token は in-memory cache のみ (1h で expire)。expire 後は再起動必要 (MVP)。
-//! 将来: refresh & introspect を background task で定期更新。
+//! Token は `Arc<RwLock<TokenSet>>` で relay と共有。admin tool 経路は
+//! `admin_exec::admin_exec_with_refresh` 経由で expiry を pre-check し、必要なら
+//! `auth::refresh()` で逐次更新する (issue: JWT expiry mid-session)。
 
 use reqwest::{Client, Method};
 use rmcp::{
@@ -29,11 +30,19 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
+use crate::config::Config;
 use crate::github_api::github_api_json;
+use crate::token_cache::TokenSet;
 
-/// MCP server で共有する不変 state (起動時に固定)。
+/// MCP server で共有する state。
+///
+/// `token` は relay loop と同じ `Arc<RwLock<TokenSet>>` を握る — どちらの経路で
+/// refresh しても他方が次回 read で最新値を見る。`cfg` と `token_cache_path` は
+/// `admin_exec_with_refresh` が `auth::refresh()` を呼ぶのに必要。
 #[derive(Clone)]
 pub struct GithubContext {
     pub github_token: String,
@@ -43,12 +52,15 @@ pub struct GithubContext {
     /// admin tool は scope に依存せず常に expose され、authorization は
     /// auth-worker `/mcp/admin/exec` 側の elevate flag で行われる。
     pub scope: String,
-    /// 生 MCP JWT (Bearer token)。admin tool が auth-worker `/mcp/admin/exec`
-    /// に proxy するときに `Authorization: Bearer <jwt>` として送る。
-    pub jwt: String,
-    /// auth-worker の origin (例: `https://auth.ippoan.org` / staging URL).
-    /// admin tool が `{auth_worker_origin}/mcp/admin/exec` を組み立てるのに使う。
-    pub auth_worker_origin: String,
+    /// MCP JWT + refresh_token (relay loop と共有)。admin tool は read lock を
+    /// 取って access_token を `Authorization: Bearer <jwt>` として送る。expiry が
+    /// 近い / 401 のとき `admin_exec_with_refresh` が write lock を取って refresh。
+    pub token: Arc<RwLock<TokenSet>>,
+    /// refresh 成功時に新 TokenSet を persist する先 (relay と同じ path を共有)。
+    pub token_cache_path: PathBuf,
+    /// `auth::refresh()` / `admin_exec` の URL 組立に使う。`cfg.auth_base` が
+    /// `{auth_worker_origin}` の役割を兼ねる。
+    pub cfg: Arc<Config>,
     pub client: Client,
 }
 
@@ -211,12 +223,30 @@ mod tests {
     use super::*;
 
     fn build_mcp(scope: &str) -> GithubMcp {
+        use chrono::Utc;
+        use crate::config::AuthEnv;
+        let cfg = Arc::new(Config {
+            env: AuthEnv::Staging,
+            auth_base: "https://auth.test.invalid".to_string(),
+            relay_base: "https://mcp.test.invalid".to_string(),
+            internal_shared_secret: "x".into(),
+            client_id: "github-mcp-server-rs".into(),
+            scope: scope.to_string(),
+        });
+        let token = Arc::new(RwLock::new(TokenSet {
+            access_token: "test-jwt".into(),
+            refresh_token: "test-refresh".into(),
+            scope: scope.to_string(),
+            expires_at: Utc::now().timestamp() + 3600,
+            obtained_at: Utc::now(),
+        }));
         let ctx = Arc::new(GithubContext {
             github_token: "x".to_string(),
             github_login: "x".to_string(),
             scope: scope.to_string(),
-            jwt: "test-jwt".to_string(),
-            auth_worker_origin: "https://auth.test.invalid".to_string(),
+            token,
+            token_cache_path: PathBuf::from("/tmp/test-token.json"),
+            cfg,
             client: Client::new(),
         });
         GithubMcp::new(ctx)

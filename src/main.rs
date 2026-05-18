@@ -26,6 +26,7 @@ mod token_cache;
 mod tools;
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 use std::path::PathBuf;
@@ -322,14 +323,18 @@ async fn run_relay(
         None => active.github_login.clone(),
     };
 
+    // Share the same Arc<RwLock<TokenSet>> between the relay loop (which
+    // refreshes on WS 401) and admin_exec_with_refresh (which refreshes on
+    // expiry / proxy 401). Either path's refresh is visible to the other.
+    let token_lock = Arc::new(RwLock::new(token));
+    let cfg_arc = Arc::new(cfg.clone());
     let ctx = Arc::new(GithubContext {
         github_token: active.github_token,
         github_login: active.github_login,
         scope: active.scope,
-        // Pass through the raw MCP JWT so admin tools can proxy via auth-worker
-        // `/mcp/admin/exec` (Authorization: Bearer <jwt>).
-        jwt: token.access_token.clone(),
-        auth_worker_origin: cfg.auth_base.clone(),
+        token: token_lock.clone(),
+        token_cache_path: path.clone(),
+        cfg: cfg_arc.clone(),
         client: client.clone(),
     });
 
@@ -364,10 +369,10 @@ async fn run_relay(
     }
 
     let relay_ctx = RelayContext {
-        cfg: Arc::new(cfg.clone()),
+        cfg: cfg_arc,
         http: client.clone(),
         login,
-        jwt: Arc::new(RwLock::new(token)),
+        jwt: token_lock,
         jwt_cache_path: path,
         svc,
         state_dir,
@@ -440,12 +445,23 @@ async fn run_pair(
     // `tools/list` は context state に依存せず 40 tools を返す。
     // 完全な tool 動作には device-flow (`auth` subcommand) か pre-staged
     // `$GITHUB_MCP_TOKEN_JSON` が引き続き必要 — 本 issue の out of scope。
+    // pair mode は JWT を持たないので空 TokenSet を入れる。admin tool は
+    // refresh_token が空で auth::refresh が即 fail → admin_exec_with_refresh が
+    // 「local refresh failed」付きの actionable error を返す挙動になる。
+    let empty_token = Arc::new(RwLock::new(TokenSet {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        scope: cfg.scope.clone(),
+        expires_at: 0,
+        obtained_at: Utc::now(),
+    }));
     let ctx = Arc::new(GithubContext {
         github_token: String::new(),
         github_login: login.clone(),
         scope: cfg.scope.clone(),
-        jwt: String::new(),
-        auth_worker_origin: cfg.auth_base.clone(),
+        token: empty_token,
+        token_cache_path: cfg.token_cache_path().unwrap_or_else(|_| PathBuf::from("/tmp/pair-no-cache")),
+        cfg: Arc::new(cfg.clone()),
         client: client.clone(),
     });
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
