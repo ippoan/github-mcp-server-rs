@@ -90,11 +90,76 @@ staging / prod の token cache は別 file (`token-staging.json` / `token-prod.j
 
 | Subcommand | 役割 |
 |---|---|
-| `auth` | Device flow を実行して token cache に保存 |
-| `whoami` | cache 読み → 期限切れなら refresh → introspect で github_token 取得 → GitHub `/user` 確認 |
-| `logout` | token cache を削除 |
-| `doctor` | 設定 / cache 状況をダンプ (secret 値は出さない) |
-| `relay` | MCP server を outbound WebSocket relay 経由で公開 (issue #27)。`wss://mcp(-staging).ippoan.org/u/<login>/connect` に接続して auth-worker `McpSession` Durable Object と長寿命 WS を張る |
+| `pair`  | **1-click pair flow** (issue #42, default for CCoW)。`POST /mcp/pair/new` → pair_url を stdout に印字 → browser 1 click → `Authorization: Bearer <pair_code>` で WS upgrade → frame bridge loop。token cache を必要としない (CCoW の reclaim でも device-code prompt が出ない) |
+| `relay` | MCP server を outbound WebSocket relay 経由で公開 (issue #27)。device-flow で取得した token cache を JWT として WS upgrade に使う。reconnect / refresh あり (long-running session 向け) |
+| `auth`  | RFC 8628 Device flow を実行して token cache に保存 (advanced; CLI / local dev / offline) |
+| `whoami`| cache 読み → 期限切れなら refresh → introspect で github_token 取得 → GitHub `/user` 確認 |
+| `logout`| token cache を削除 |
+| `doctor`| 設定 / cache 状況をダンプ (secret 値は出さない) |
+
+## 1-click pair flow (CCoW default, issue #42)
+
+Claude Code on the Web (CCoW) のコンテナは reclaim ごとに `$HOME` が消えるため、
+device-flow の token cache (`~/.config/.../token-staging.json`) が毎回消失する。
+従来 `install-mcp.sh` は新コンテナで RFC 8628 device-code プロンプトを出していたが、
+v0.0.15 から **1-click pair** が default 経路:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. session-start hook が `pair` subcommand を nohup で起動              │
+│      → POST https://mcp(-staging).ippoan.org/mcp/pair/new              │
+│        body = {claim_login: $GITHUB_LOGIN, binary_version: ...}        │
+│      ← 200 {pair_code, pair_url, expires_in: 300}                      │
+│                                                                      │
+│ 2. binary が pair_url を stdout に 1 行印字 (install-mcp.sh が grep)     │
+│      → ユーザーは表示された URL をブラウザで開く                          │
+│                                                                      │
+│ 3. ブラウザ: auth-worker `/mcp/pair/<code>` を踏む (sticky cookie session)│
+│      → 未認証なら GitHub OAuth → callback で session を sign + redirect   │
+│      → claim_login と session.github_login が一致したら binding_jwt を mint│
+│      → KV `mcp/pair/<code>` を status="approved" + binding_jwt に更新   │
+│                                                                      │
+│ 4. binary は `Authorization: Bearer <pair_code>` で WS upgrade を polling │
+│      ← 401 + `Pair-Status: pending` → 2s sleep → retry (最大 5min)      │
+│      ← 101 → auth-worker が内部で pair_code を binding_jwt に置換して DO に│
+│              forward → frame bridge loop に合流                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+CCoW の設定 (1 度だけ):
+
+1. **Environment variables** に `GITHUB_LOGIN=<your-github-username>` を追加
+   (pair flow の `claim_login` として送信される — secret ではないので KV/Secret-mgr
+   には入れずに env 経由で OK)
+2. Claude Code Web の **MCP servers** に `https://mcp(-staging).ippoan.org/u/<login>/mcp`
+   を 1 度だけ登録 (URL は github_login で固定)
+
+opt-in で旧 device-flow に戻す:
+
+```bash
+GITHUB_MCP_AUTO_DEVICE_FLOW=1  # session-start hook が `pair` の代わりに `auth` を呼ぶ
+```
+
+`$GITHUB_LOGIN` 未設定で `$GITHUB_MCP_AUTO_DEVICE_FLOW` も `1` でない場合、
+install-mcp.sh は明確な error を出して停止する (Settings → Environment variables への
+案内付き)。
+
+### Pair mode の制約
+
+`pair` flow は **WS 接続専用**: binding_jwt は auth-worker の内部にのみ存在し、
+binary 側には `pair_code` しか渡らない。したがって、
+
+- `tools/list` は 40 tools を返す (router は context state 非依存)
+- `whoami` / GitHub API を直接叩く tool は `github_token` 不在で 401
+- admin tool (`set/get/delete_branch_protection`) は binary 側 JWT 不在で auth-worker
+  `/mcp/admin/exec` が 401
+
+完全な tool 動作のためには:
+
+- `auth` subcommand (RFC 8628 device flow) で token を取得するか
+- pre-staged `$GITHUB_MCP_TOKEN_JSON` を CCoW Setup secret に登録するか
+
+のいずれかが必要 (本 issue の out of scope。30-day auto-pair は将来の cycle)。
 
 ## MCP server mode (relay)
 

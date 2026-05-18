@@ -89,6 +89,24 @@ impl Config {
         format!("{scheme_swapped}/u/{login}/connect")
     }
 
+    /// `https://mcp(-staging).ippoan.org/mcp/pair/new` を組み立てる
+    /// (issue #42 / auth-worker #144 の 1-click pair の起点)。
+    /// `pair_new` endpoint は auth-worker が `auth.ippoan.org` / `mcp.ippoan.org`
+    /// の両 origin で expose しているが、binary は **relay 側** origin を叩く
+    /// (issue 仕様 = `RELAY_BASE と同じ origin`)。`relay_base` が `ws(s)://` で
+    /// 渡されていた場合は `http(s)://` に戻して返す。
+    pub fn pair_new_url(&self) -> String {
+        let trimmed = self.relay_base.trim_end_matches('/');
+        let scheme_swapped = if let Some(rest) = trimmed.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            trimmed.to_string()
+        };
+        format!("{scheme_swapped}/mcp/pair/new")
+    }
+
     /// `https://mcp(-staging).ippoan.org/u/<login>/mcp` を組み立てる
     /// (Claude Code Web に登録する公開 URL)。`relay_base` が `ws(s)://` で渡されていた場合は
     /// 元の `http(s)://` に戻して返す。
@@ -182,6 +200,42 @@ mod tests {
             c.relay_public_url("alice"),
             "https://mcp.ippoan.org/u/alice/mcp"
         );
+    }
+
+    #[test]
+    fn pair_new_url_https_staging() {
+        let c = cfg_with(AuthEnv::Staging, "https://mcp-staging.ippoan.org");
+        assert_eq!(
+            c.pair_new_url(),
+            "https://mcp-staging.ippoan.org/mcp/pair/new"
+        );
+    }
+
+    #[test]
+    fn pair_new_url_https_prod() {
+        let c = cfg_with(AuthEnv::Prod, "https://mcp.ippoan.org");
+        assert_eq!(c.pair_new_url(), "https://mcp.ippoan.org/mcp/pair/new");
+    }
+
+    #[test]
+    fn pair_new_url_strips_trailing_slash() {
+        let c = cfg_with(AuthEnv::Staging, "https://mcp-staging.ippoan.org/");
+        assert_eq!(
+            c.pair_new_url(),
+            "https://mcp-staging.ippoan.org/mcp/pair/new"
+        );
+    }
+
+    #[test]
+    fn pair_new_url_unwraps_wss_to_https() {
+        let c = cfg_with(AuthEnv::Prod, "wss://mcp.ippoan.org");
+        assert_eq!(c.pair_new_url(), "https://mcp.ippoan.org/mcp/pair/new");
+    }
+
+    #[test]
+    fn pair_new_url_unwraps_ws_to_http() {
+        let c = cfg_with(AuthEnv::Staging, "ws://localhost:18099");
+        assert_eq!(c.pair_new_url(), "http://localhost:18099/mcp/pair/new");
     }
 
     #[test]

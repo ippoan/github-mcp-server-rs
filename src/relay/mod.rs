@@ -23,7 +23,7 @@
 pub mod bridge;
 pub mod frame;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
@@ -462,6 +462,253 @@ fn map_handshake_err(err: tokio_tungstenite::tungstenite::Error) -> RelayError {
     }
 }
 
+/// pair WS upgrade の handshake response 分類 (issue #42).
+///
+/// auth-worker `mcp-relay-connect.ts` の 3 値が返る前提:
+///   - 401 + `Pair-Status: pending`        → pending (2s sleep retry の signal)
+///   - 401 (no `Pair-Status`)              → unauthorized (pair_code が unknown / 失効)
+///   - 403                                 → user mismatch
+///   - 101 (success)                       → caller 側で handshake 成功扱い
+///
+/// その他 / network error は `Network` 扱い (caller が retry するかは別)。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PairHandshakeOutcome {
+    Pending,
+    Unauthorized,
+    Other(u16),
+    Network,
+}
+
+pub(crate) fn classify_pair_handshake_err(
+    err: &tokio_tungstenite::tungstenite::Error,
+) -> PairHandshakeOutcome {
+    use tokio_tungstenite::tungstenite::Error as WsErr;
+    match err {
+        WsErr::Http(resp) => {
+            let code = resp.status().as_u16();
+            if code == 401 {
+                let pending = resp
+                    .headers()
+                    .get("Pair-Status")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.eq_ignore_ascii_case("pending"))
+                    .unwrap_or(false);
+                if pending {
+                    PairHandshakeOutcome::Pending
+                } else {
+                    PairHandshakeOutcome::Unauthorized
+                }
+            } else {
+                PairHandshakeOutcome::Other(code)
+            }
+        }
+        _ => PairHandshakeOutcome::Network,
+    }
+}
+
+/// Pair flow 用の relay context — `TokenSet` / refresh / introspect を持たない軽量版。
+///
+/// pair_code は 1 回限り消費される (auth-worker `mcp-relay-connect.ts` で
+/// `deletePair` される) ため、WS が落ちたら **reconnect しない**。pair session
+/// は本質的に single-shot で、install-mcp.sh は次回 session-start で `pair`
+/// subcommand を再呼び出しして新 pair_code を取り直す前提。
+pub struct PairRelayContext<S> {
+    pub cfg: Arc<Config>,
+    pub login: String,
+    /// rmcp `StreamableHttpService` (`relay::run_relay` と同じ型)。
+    pub svc: S,
+    pub state_dir: Option<PathBuf>,
+    pub print_status: bool,
+}
+
+/// `pair` subcommand の WS bridge ループ entry。
+///
+/// 手順:
+///   1. `Authorization: Bearer <pair_code>` で WS upgrade を試行
+///      - 401 + `Pair-Status: pending` → 2s sleep → retry (deadline まで)
+///      - 101 → break (frame loop へ進む)
+///      - その他 → Err
+///   2. handshake 成功で `<state_dir>/url` に public URL を書く + sentinel を出す
+///   3. 既存の Frame::Req dispatch ループ (`handle_incoming_text`) を回す
+///   4. WS close → `Ok(())` で抜ける (caller が次セッションで再 pair する)
+pub async fn run_pair_session<S, RB>(
+    ctx: PairRelayContext<S>,
+    pair_code: String,
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    S: Service<HttpRequest<Body>, Response = HttpResponse<RB>, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    RB: http_body::Body<Data = Bytes> + Send + 'static,
+    RB::Error: std::error::Error + Send + Sync + 'static,
+{
+    let url = ctx.cfg.relay_ws_connect_url(&ctx.login);
+    if ctx.print_status {
+        eprintln!("→ pair: connecting to {url} as {}", ctx.login);
+    }
+
+    // ── 1. retry-on-pending handshake ────────────────────────────────────
+    let ws_stream = loop {
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "pair: pair_code expired before browser approval (deadline reached). \
+                 Re-run the session-start hook to mint a new pair_url."
+            );
+        }
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri(&url)
+            .header("Host", host_from_url(&url))
+            .header("Authorization", format!("Bearer {pair_code}"))
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header(
+                "User-Agent",
+                concat!("github-mcp-server-rs/", env!("CARGO_PKG_VERSION")),
+            )
+            .body(())
+            .with_context(|| "pair: build WS request")?;
+
+        match connect_async(req).await {
+            Ok((stream, _resp)) => break stream,
+            Err(e) => match classify_pair_handshake_err(&e) {
+                PairHandshakeOutcome::Pending => {
+                    if ctx.print_status {
+                        eprintln!("⋯ pair: waiting for browser approval (Pair-Status: pending)");
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                PairHandshakeOutcome::Unauthorized => {
+                    bail!(
+                        "pair: WS upgrade rejected with 401 (no Pair-Status header). \
+                         pair_code likely unknown / consumed / expired."
+                    );
+                }
+                PairHandshakeOutcome::Other(code) => {
+                    bail!("pair: WS upgrade failed with HTTP {code}: {e}");
+                }
+                PairHandshakeOutcome::Network => {
+                    bail!("pair: WS connect network error: {e}");
+                }
+            },
+        }
+    };
+
+    // ── 2. surface public URL / sentinel after handshake success ─────────
+    if let Some(dir) = &ctx.state_dir {
+        let public = ctx.cfg.relay_public_url(&ctx.login);
+        let path = dir.join("url");
+        if let Err(e) = std::fs::write(&path, &public) {
+            tracing::warn!("pair: failed to write relay url to {}: {e}", path.display());
+        }
+        if ctx.print_status {
+            eprintln!("⇒ pair: public URL = {public}");
+        }
+    }
+    if ctx.print_status {
+        eprintln!("✓ pair: WS upgrade accepted (browser click received)");
+    }
+
+    // ── 3. frame loop (single-shot) ──────────────────────────────────────
+    let (sink, mut stream) = ws_stream.split();
+    let (out_tx, out_rx) = mpsc::channel::<OutMsg>(64);
+    let writer = tokio::spawn(writer_task(sink, out_rx));
+
+    let hello = Frame::hello(env!("CARGO_PKG_VERSION"));
+    if out_tx.send(OutMsg::Frame(hello)).await.is_err() {
+        writer.abort();
+        bail!("pair: writer task closed before hello");
+    }
+
+    // Build a throwaway RelayContext-ish shim *only* for `handle_incoming_text`:
+    // that function only reads `ctx.svc`, so we can synthesize a minimal struct
+    // by passing through the same svc. Simplest: inline the dispatch here so we
+    // do not need to clone TokenSet machinery we do not have.
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(Message::Text(txt)) => {
+                handle_incoming_pair_text(&ctx.svc, &out_tx, &txt).await;
+            }
+            Ok(Message::Binary(_)) => {
+                tracing::warn!("pair: ignoring unexpected Binary frame");
+            }
+            Ok(Message::Ping(p)) => {
+                let _ = out_tx.send(OutMsg::Pong(p.to_vec())).await;
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => {
+                if ctx.print_status {
+                    eprintln!("✓ pair: peer closed WS — exiting (single-shot)");
+                }
+                break;
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(e) => {
+                tracing::warn!("pair: ws read error: {e}");
+                break;
+            }
+        }
+    }
+
+    drop(out_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// `handle_incoming_text` の pair flow 版 — `RelayContext<S>` ではなく
+/// `S: Service` を直接受ける以外は同じ挙動。重複だが、`PairRelayContext` には
+/// `jwt` 等の不要 field を生やしたくないので関数を分けている。
+async fn handle_incoming_pair_text<S, RB>(svc: &S, out: &mpsc::Sender<OutMsg>, text: &str)
+where
+    S: Service<HttpRequest<Body>, Response = HttpResponse<RB>, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    RB: http_body::Body<Data = Bytes> + Send + 'static,
+    RB::Error: std::error::Error + Send + Sync + 'static,
+{
+    let parsed = match Frame::from_json(text) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("pair: malformed frame ({e}): {}", truncate(text, 256));
+            return;
+        }
+    };
+    if parsed.version() != FRAME_VERSION {
+        tracing::warn!(
+            "pair: dropped frame v={} (binary supports v={})",
+            parsed.version(),
+            FRAME_VERSION
+        );
+        return;
+    }
+    match parsed {
+        Frame::Req { .. } => {
+            let svc = svc.clone();
+            let out = out.clone();
+            tokio::spawn(async move {
+                let resp = bridge::dispatch_frame(&svc, parsed).await;
+                let _ = out.send(OutMsg::Frame(resp)).await;
+            });
+        }
+        Frame::Resp { .. } => {
+            tracing::debug!("pair: ignoring Resp frame from peer");
+        }
+        Frame::Hello { .. } => {
+            tracing::debug!("pair: ignoring Hello frame from peer");
+        }
+    }
+}
+
 fn classify_close(c: Option<&CloseFrame>) -> Option<RelayError> {
     match c {
         Some(cf) => {
@@ -629,6 +876,67 @@ mod tests {
         assert_eq!(
             s.on_network_error(),
             LoopAction::Reconnect(Duration::from_secs(1))
+        );
+    }
+
+    // ─── classify_pair_handshake_err (issue #42) ─────────────────────────
+
+    fn http_resp_with(
+        status: u16,
+        headers: &[(&str, &str)],
+    ) -> tokio_tungstenite::tungstenite::Error {
+        use tokio_tungstenite::tungstenite::http;
+        let mut b = http::Response::builder().status(status);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let resp = b.body(None).unwrap();
+        tokio_tungstenite::tungstenite::Error::Http(resp)
+    }
+
+    #[test]
+    fn classify_pair_handshake_401_pending_is_pending() {
+        let err = http_resp_with(401, &[("Pair-Status", "pending")]);
+        assert_eq!(
+            classify_pair_handshake_err(&err),
+            PairHandshakeOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn classify_pair_handshake_401_no_pending_is_unauthorized() {
+        let err = http_resp_with(401, &[]);
+        assert_eq!(
+            classify_pair_handshake_err(&err),
+            PairHandshakeOutcome::Unauthorized
+        );
+    }
+
+    #[test]
+    fn classify_pair_handshake_401_other_pair_status_is_unauthorized() {
+        let err = http_resp_with(401, &[("Pair-Status", "approved")]);
+        assert_eq!(
+            classify_pair_handshake_err(&err),
+            PairHandshakeOutcome::Unauthorized
+        );
+    }
+
+    #[test]
+    fn classify_pair_handshake_403_is_other() {
+        let err = http_resp_with(403, &[]);
+        assert_eq!(
+            classify_pair_handshake_err(&err),
+            PairHandshakeOutcome::Other(403)
+        );
+    }
+
+    #[test]
+    fn classify_pair_handshake_non_http_is_network() {
+        use tokio_tungstenite::tungstenite::Error as WsErr;
+        let err = WsErr::ConnectionClosed;
+        assert_eq!(
+            classify_pair_handshake_err(&err),
+            PairHandshakeOutcome::Network
         );
     }
 
