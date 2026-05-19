@@ -42,6 +42,17 @@ jobs:
     secrets:
       BUILD_SECRET: ${{ secrets.MCP_INTERNAL_SECRET }}
 
+  # ippoan/mcp-relay-rs の最新 `dev-N` tag に追従しているか確認。
+  # 古い `dev-N` に張り付いてると Step Summary + `::warning::` で通知される。
+  # warn-only (fail させない) なので auto-merge は止めない。
+  check-mcp-relay:
+    name: mcp-relay version check
+    uses: ippoan/ci-workflows/.github/workflows/check-dep-version.yml@main
+    with:
+      dep_name: mcp-relay
+      dep_repo: ippoan/mcp-relay-rs
+      tag_prefix: 'dev-'
+
   auto-merge:
     name: Auto Merge
     needs: [ci]
