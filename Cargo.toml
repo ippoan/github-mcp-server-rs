@@ -12,9 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Phase 2: shared device-flow / pair / relay logic moved to mcp-relay-rs
-# (ippoan/ref-files-mcp-server-rs#4). Branch ref temporary — switch to
-# `tag = "v0.0.1"` once tagged on main.
-mcp-relay = { git = "https://github.com/ippoan/mcp-relay-rs.git", branch = "claude/test-ref-files-mcp-A7YVq" }
+# (ippoan/ref-files-mcp-server-rs#4). `dev-N` channel pin で main HEAD を追従。
+# stable リリース時に `tag = "v0.0.X"` へ昇格する。
+mcp-relay = { git = "https://github.com/ippoan/mcp-relay-rs.git", tag = "dev-1" }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }

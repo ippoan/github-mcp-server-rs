@@ -1060,7 +1060,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-relay"
 version = "0.0.1"
-source = "git+https://github.com/ippoan/mcp-relay-rs.git?branch=claude%2Ftest-ref-files-mcp-A7YVq#5c97a5349f3539e6fece1cd19992b6b51124a267"
+source = "git+https://github.com/ippoan/mcp-relay-rs.git?tag=dev-1#cb2764d2cc0c84c49bd365f6ac81ad56608d96b5"
 dependencies = [
  "anyhow",
  "axum",

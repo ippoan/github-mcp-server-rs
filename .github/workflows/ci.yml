@@ -54,3 +54,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    secrets:
+      # PAT で merge することで merge commit が PAT user 作者になり、main push
+      # event が普通に他 workflow を trigger できる ("GITHUB_TOKEN events don't
+      # fire workflows" の制約回避)。これで `dev-release.yml` が auto 発火する
+      # ようになる (今まで `dev-N` tag が一度も無かった理由)。
+      AUTO_MERGE_PAT: ${{ secrets.TAG_RELEASE_PAT }}
