@@ -558,6 +558,7 @@ mod tests {
             internal_shared_secret: "x".into(),
             client_id: "github-mcp-server-rs".into(),
             scope: "mcp.read mcp.write".into(),
+            project_name: "github-mcp-server-rs",
         });
         let token = TokenSet {
             access_token: access.into(),

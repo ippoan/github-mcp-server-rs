@@ -232,6 +232,7 @@ mod tests {
             internal_shared_secret: "x".into(),
             client_id: "github-mcp-server-rs".into(),
             scope: scope.to_string(),
+            project_name: "github-mcp-server-rs",
         });
         let token = Arc::new(RwLock::new(TokenSet {
             access_token: "test-jwt".into(),

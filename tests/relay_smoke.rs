@@ -38,30 +38,12 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 use tower::Service;
 
-// ----- src/ を test crate に mount (mod 名は src/ と一致) -----
-#[path = "../src/admin_exec.rs"]
-mod admin_exec;
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/config.rs"]
-mod config;
-#[path = "../src/github_api.rs"]
-mod github_api;
-#[path = "../src/introspect.rs"]
-mod introspect;
-#[path = "../src/mcp_server.rs"]
-mod mcp_server;
-#[path = "../src/relay/mod.rs"]
-mod relay;
-#[path = "../src/token_cache.rs"]
-mod token_cache;
-#[path = "../src/tools/mod.rs"]
-mod tools;
-// -----------------------------------------------------------
-
-use crate::config::{AuthEnv, Config};
-use crate::relay::{run_relay, RelayContext};
-use crate::token_cache::TokenSet;
+// Phase 2: auth / config / pair / relay / token_cache は mcp-relay crate に移動した。
+// 整数テストは crate 直接 import に切替。残った binary-only modules (admin_exec /
+// mcp_server / github_api / introspect / tools) はこのテストでは未使用。
+use mcp_relay::config::{AuthEnv, Config};
+use mcp_relay::relay::{run_relay, RelayContext};
+use mcp_relay::token_cache::TokenSet;
 
 #[derive(Clone)]
 struct EchoSvc;
@@ -118,6 +100,7 @@ async fn spawn_relay_against(
         internal_shared_secret: "x".into(),
         client_id: "test".into(),
         scope: "mcp.read mcp.write".into(),
+        project_name: "github-mcp-server-rs",
     };
 
     let svc = EchoSvc;
@@ -130,6 +113,8 @@ async fn spawn_relay_against(
         svc,
         state_dir,
         print_status: false,
+        service: "github-mcp-server-rs",
+        binary_version: env!("CARGO_PKG_VERSION"),
     };
 
     tokio::spawn(async move { run_relay(ctx).await })

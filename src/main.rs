@@ -15,15 +15,14 @@
 //!     4. dev fallback `"dev-secret-do-not-use"` (本物 auth-worker は 401 を返す)
 
 mod admin_exec;
-mod auth;
-mod config;
 mod github_api;
 mod introspect;
 mod mcp_server;
-mod pair;
-mod relay;
-mod token_cache;
 mod tools;
+
+// Phase 2: auth / config / pair / relay / token_cache は mcp-relay crate に移動
+// (ippoan/ref-files-mcp-server-rs#4)。`crate::<name>` 参照を残すための re-export。
+pub use mcp_relay::{auth, config, pair, relay, token_cache};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -177,6 +176,7 @@ fn build_config(cli: &Cli) -> Result<Config> {
         internal_shared_secret,
         client_id: cli.client_id.clone(),
         scope: cli.scope.clone(),
+        project_name: "github-mcp-server-rs",
     })
 }
 
@@ -377,6 +377,8 @@ async fn run_relay(
         svc,
         state_dir,
         print_status,
+        service: "github-mcp-server-rs",
+        binary_version: env!("CARGO_PKG_VERSION"),
     };
 
     relay::run_relay(relay_ctx).await
@@ -489,6 +491,8 @@ async fn run_pair(
         svc,
         state_dir,
         print_status,
+        service: "github-mcp-server-rs",
+        binary_version: env!("CARGO_PKG_VERSION"),
     };
     relay::run_pair_session(pair_ctx, resp.pair_code, deadline).await
 }
