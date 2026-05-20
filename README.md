@@ -1,3 +1,5 @@
+> ⚠️ **このリポジトリは [ippoan/mcp-relay-rs](https://github.com/ippoan/mcp-relay-rs) に統合済 (Phase 4 / 2026-05-20)**。新規 issue / PR は monorepo 側へ。既存 release artifact (v0.0.X / dev-N) は互換性のため残置。
+
 # github-mcp-server-rs
 
 GitHub MCP server (Model Context Protocol) — `auth-worker` の **Device Authorization Grant (RFC 8628)** クライアント実装。
